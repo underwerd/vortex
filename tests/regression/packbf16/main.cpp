@@ -60,7 +60,7 @@ static uint16_t bf16_add(uint16_t a, uint16_t b) {
     return f32_to_bf16(result);
 }
 
-static void cleanup() {
+void cleanup() {
     if (device) {
         if (src_a_buf) vx_buffer_release(src_a_buf);
         if (src_b_buf) vx_buffer_release(src_b_buf);
@@ -78,15 +78,31 @@ int main(int argc, char* argv[]) {
     if (argc > 2 && strcmp(argv[1], "-k") == 0)
         kernel_file = argv[2];
 
-    uint32_t num_threads = 4;
-    uint32_t total = num_threads * NUM_POINTS;
+    srand(42);
 
-    // Generate test data
+    // open device connection
+    std::cout << "open device connection" << std::endl;
+    RT_CHECK(vx_device_open(0, &device));
+
+    vx_queue_info_t qi = { sizeof(qi), nullptr, VX_QUEUE_PRIORITY_NORMAL, 0 };
+    RT_CHECK(vx_queue_create(device, &qi, &queue));
+
+    uint64_t num_cores, num_threads;
+    RT_CHECK(vx_device_query(device, VX_CAPS_NUM_CORES, &num_cores));
+    RT_CHECK(vx_device_query(device, VX_CAPS_NUM_THREADS, &num_threads));
+
+    uint32_t total = (uint32_t)(num_cores * num_threads) * NUM_POINTS;
+    uint32_t buf_size = total * sizeof(uint32_t);
+
+    std::cout << "num_cores=" << num_cores << " num_threads=" << num_threads << std::endl;
+    std::cout << "total elements: " << total << std::endl;
+    std::cout << "buffer size: " << buf_size << " bytes" << std::endl;
+
+    // generate test data
     std::vector<uint32_t> h_src_a(total), h_src_b(total);
     std::vector<uint32_t> h_dst_mul(total), h_dst_add(total);
     std::vector<uint32_t> ref_mul(total), ref_add(total);
 
-    srand(42);
     for (uint32_t i = 0; i < total; ++i) {
         uint16_t a_lo = rand() & 0xFFFF;
         uint16_t a_hi = rand() & 0xFFFF;
@@ -102,35 +118,59 @@ int main(int argc, char* argv[]) {
         ref_add[i] = ((uint32_t)r_add_hi << 16) | r_add_lo;
     }
 
-    RT_CHECK(vx_device_init(&device));
-    RT_CHECK(vx_queue_create(device, &queue));
-
-    RT_CHECK(vx_buffer_allocate(device, total * sizeof(uint32_t), &src_a_buf));
-    RT_CHECK(vx_buffer_allocate(device, total * sizeof(uint32_t), &src_b_buf));
-    RT_CHECK(vx_buffer_allocate(device, total * sizeof(uint32_t), &dst_mul_buf));
-    RT_CHECK(vx_buffer_allocate(device, total * sizeof(uint32_t), &dst_add_buf));
-
-    RT_CHECK(vx_buffer_write(src_a_buf, h_src_a.data(), 0, total * sizeof(uint32_t)));
-    RT_CHECK(vx_buffer_write(src_b_buf, h_src_b.data(), 0, total * sizeof(uint32_t)));
-
-    RT_CHECK(vx_module_load(device, kernel_file, &module_));
-    RT_CHECK(vx_kernel_create(device, module_, "kernel_main", &kernel));
+    // allocate device memory
+    std::cout << "allocate device memory" << std::endl;
+    RT_CHECK(vx_buffer_create(device, buf_size, VX_MEM_READ, &src_a_buf));
+    RT_CHECK(vx_buffer_create(device, buf_size, VX_MEM_READ, &src_b_buf));
+    RT_CHECK(vx_buffer_create(device, buf_size, VX_MEM_WRITE, &dst_mul_buf));
+    RT_CHECK(vx_buffer_create(device, buf_size, VX_MEM_WRITE, &dst_add_buf));
 
     kernel_arg_t karg;
-    karg.src_a_addr  = vx_buffer_addr(src_a_buf);
-    karg.src_b_addr  = vx_buffer_addr(src_b_buf);
-    karg.dst_mul_addr = vx_buffer_addr(dst_mul_buf);
-    karg.dst_add_addr = vx_buffer_addr(dst_add_buf);
+    RT_CHECK(vx_buffer_address(src_a_buf, &karg.src_a_addr));
+    RT_CHECK(vx_buffer_address(src_b_buf, &karg.src_b_addr));
+    RT_CHECK(vx_buffer_address(dst_mul_buf, &karg.dst_mul_addr));
+    RT_CHECK(vx_buffer_address(dst_add_buf, &karg.dst_add_addr));
 
-    RT_CHECK(vx_kernel_set_arg(kernel, 0, &karg, sizeof(kernel_arg_t)));
-    RT_CHECK(vx_kernel_set_work_size(kernel, num_threads, 1, 1));
-    RT_CHECK(vx_kernel_enqueue(kernel, queue));
-    RT_CHECK(vx_queue_sync(queue));
+    // upload source buffers
+    std::cout << "upload source buffers" << std::endl;
+    RT_CHECK(vx_enqueue_write(queue, src_a_buf, 0, h_src_a.data(), buf_size, 0, nullptr, nullptr));
+    RT_CHECK(vx_enqueue_write(queue, src_b_buf, 0, h_src_b.data(), buf_size, 0, nullptr, nullptr));
 
-    RT_CHECK(vx_buffer_read(dst_mul_buf, h_dst_mul.data(), 0, total * sizeof(uint32_t)));
-    RT_CHECK(vx_buffer_read(dst_add_buf, h_dst_add.data(), 0, total * sizeof(uint32_t)));
+    // load kernel module
+    std::cout << "load kernel module" << std::endl;
+    RT_CHECK(vx_module_load_file(device, kernel_file, &module_));
+    RT_CHECK(vx_module_get_kernel(module_, "main", &kernel));
 
-    // Verify results
+    // launch kernel
+    std::cout << "launch kernel" << std::endl;
+    vx_event_h launch_ev = nullptr, read_mul_ev = nullptr, read_add_ev = nullptr;
+    {
+        vx_launch_info_t li = {};
+        li.struct_size  = sizeof(li);
+        li.kernel       = kernel;
+        li.args_host    = &karg;
+        li.args_size    = sizeof(karg);
+        li.ndim         = 1;
+        li.grid_dim[0]  = (uint32_t)num_cores;
+        li.block_dim[0] = (uint32_t)num_threads;
+        RT_CHECK(vx_enqueue_launch(queue, &li, 0, nullptr, &launch_ev));
+    }
+
+    // download destination buffers
+    std::cout << "download destination buffers" << std::endl;
+    RT_CHECK(vx_enqueue_read(queue, h_dst_mul.data(), dst_mul_buf, 0, buf_size, 1, &launch_ev, &read_mul_ev));
+    RT_CHECK(vx_enqueue_read(queue, h_dst_add.data(), dst_add_buf, 0, buf_size, 1, &launch_ev, &read_add_ev));
+
+    // wait for completion
+    std::cout << "wait for completion" << std::endl;
+    RT_CHECK(vx_event_wait_value(read_mul_ev, 1, VX_TIMEOUT_INFINITE));
+    RT_CHECK(vx_event_wait_value(read_add_ev, 1, VX_TIMEOUT_INFINITE));
+    vx_event_release(read_mul_ev);
+    vx_event_release(read_add_ev);
+    vx_event_release(launch_ev);
+
+    // verify results
+    std::cout << "verify results" << std::endl;
     int errors = 0;
     for (uint32_t i = 0; i < total; ++i) {
         if (h_dst_mul[i] != ref_mul[i]) {
