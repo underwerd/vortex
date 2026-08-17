@@ -393,6 +393,10 @@ package VX_gpu_pkg;
     // Warp-Level Lane Gather Extension
     localparam INST_WGATHER =    4'h8; // ALU_TYPE_OTHER, alu_op[3]=1
 
+    // Packed BF16 Arithmetic Extension (funct7=5 in EXT1)
+    localparam INST_PACKBF16_MUL = 4'hC; // ALU_TYPE_OTHER, alu_op[3:2]=11, op[0]=0
+    localparam INST_PACKBF16_ADD = 4'hD; // ALU_TYPE_OTHER, alu_op[3:2]=11, op[0]=1
+
     ///////////////////////////////////////////////////////////////////////////
 
     localparam INST_M_MUL =      3'b000;

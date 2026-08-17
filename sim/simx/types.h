@@ -323,8 +323,27 @@ struct IntrWgatherArgs {
   uint32_t src_lane : 2;
 };
 
+struct IntrPackBf16Args {
+};
+
 inline std::ostream &operator<<(std::ostream &os, const WgatherType& /*type*/) {
   os << "WGATHER";
+  return os;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+enum class PackBf16Type {
+  MUL,
+  ADD
+};
+
+inline std::ostream &operator<<(std::ostream &os, const PackBf16Type& type) {
+  switch (type) {
+  case PackBf16Type::MUL: os << "PACKBF16.MUL"; break;
+  case PackBf16Type::ADD: os << "PACKBF16.ADD"; break;
+  default: os << "PACKBF16.?"; break;
+  }
   return os;
 }
 
@@ -803,6 +822,7 @@ using OpType = std::variant<
 , VoteType
 , ShflType
 , WgatherType
+, PackBf16Type
 , WctlType
 #ifdef VX_CFG_EXT_DXA_ENABLE
 , DxaType
@@ -830,6 +850,7 @@ using IntrArgs = std::variant<
 , IntrFpuArgs
 , IntrCsrArgs
 , IntrWgatherArgs
+, IntrPackBf16Args
 , IntrWctlArgs
 #ifdef VX_CFG_EXT_DXA_ENABLE
 , IntrDxaArgs

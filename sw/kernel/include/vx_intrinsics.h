@@ -562,6 +562,28 @@ inline float vx_packlh_f(const void* base, uint32_t stride) {
     return out;
 }
 
+// Packed bf16 multiply: two bf16 values per 32-bit word, per-lane multiply.
+// rs1[15:0]  * rs2[15:0]  -> rd[15:0]
+// rs1[31:16] * rs2[31:16] -> rd[31:16]
+__attribute__((always_inline))
+inline uint32_t vx_packbf16_mul(uint32_t a, uint32_t b) {
+    uint32_t out;
+    __asm__ volatile (
+        ".insn r %1, 0, 5, %0, %2, %3" : "=r"(out) : "i"(RISCV_CUSTOM0), "r"(a), "r"(b)
+    );
+    return out;
+}
+
+// Packed bf16 add: two bf16 values per 32-bit word, per-lane add.
+__attribute__((always_inline))
+inline uint32_t vx_packbf16_add(uint32_t a, uint32_t b) {
+    uint32_t out;
+    __asm__ volatile (
+        ".insn r %1, 1, 5, %0, %2, %3" : "=r"(out) : "i"(RISCV_CUSTOM0), "r"(a), "r"(b)
+    );
+    return out;
+}
+
 #ifdef __cplusplus
 }
 #endif

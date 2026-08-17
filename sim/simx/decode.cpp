@@ -141,6 +141,13 @@ static op_string_t op_string(const Instr &instr) {
     [&](WgatherType)-> op_string_t {
       return {"WGATHER", ""};
     },
+    [&](PackBf16Type bf16_type)-> op_string_t {
+      switch (bf16_type) {
+      case PackBf16Type::MUL: return {"PACKBF16.MUL", ""};
+      case PackBf16Type::ADD: return {"PACKBF16.ADD", ""};
+      default: return {"PACKBF16.?", ""};
+      }
+    },
     [&](BrType br_type)-> op_string_t {
       auto brArgs = std::get<IntrBrArgs>(instrArgs);
       switch (br_type) {
@@ -948,6 +955,18 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       }
       instr->set_macro_op();
       instr->set_wstall(true);   // pause fetch while sequencer expands the N uops
+    } break;
+    case 5: { // Packed BF16 arithmetic: packbf16.mul / packbf16.add
+      instr->set_dest_reg(rd, RegType::Integer);
+      instr->set_src_reg(0, rs1, RegType::Integer);
+      instr->set_src_reg(1, rs2, RegType::Integer);
+      instr->set_args(IntrPackBf16Args{});
+      switch (funct3) {
+      case 0: instr->set_op_type(PackBf16Type::MUL); break;
+      case 1: instr->set_op_type(PackBf16Type::ADD); break;
+      default:
+        std::abort();
+      }
     } break;
     default:
       std::abort();

@@ -733,6 +733,15 @@ module VX_decode import
                             default:;
                         endcase
                     end
+                    7'h05: begin // Packed BF16: packbf16.mul / packbf16.add
+                        ex_type = EX_ALU;
+                        op_args.alu.xtype = ALU_TYPE_OTHER;
+                        op_args.alu.is_w  = 0;
+                        `USED_IREG (rd);
+                        `USED_IREG (rs1);
+                        `USED_IREG (rs2);
+                        op_type = INST_OP_BITS'(funct3[0] ? INST_PACKBF16_ADD : INST_PACKBF16_MUL);
+                    end
                     default:;
                 endcase
             end

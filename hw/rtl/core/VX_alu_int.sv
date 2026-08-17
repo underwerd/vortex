@@ -222,6 +222,19 @@ module VX_alu_int import VX_gpu_pkg::*; #(
         assign shfl_result[0] = alu_in1[0];
     end
 
+    // Packed BF16 arithmetic (packbf16.mul / packbf16.add)
+    wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] packbf16_result;
+    wire packbf16_is_add = alu_op[0];
+    VX_packbf16_arith #(
+        .INSTANCE_ID (`SFORMATF(("%s-packbf16", INSTANCE_ID))),
+        .NUM_LANES (NUM_LANES)
+    ) packbf16_inst (
+        .rs1    (alu_in1),
+        .rs2    (alu_in2_imm),
+        .is_add (packbf16_is_add),
+        .result (packbf16_result)
+    );
+
     for (genvar i = 0; i < NUM_LANES; ++i) begin : g_alu_result
         wire [`VX_CFG_XLEN-1:0] slt_br_result = `VX_CFG_XLEN'({is_br_op && ~(| sub_result[i][`VX_CFG_XLEN-1:0]), sub_result[i][`VX_CFG_XLEN]});
         wire [`VX_CFG_XLEN-1:0] sub_slt_br_result = (is_sub_op && ~is_br_op) ? sub_result[i][`VX_CFG_XLEN-1:0] : slt_br_result;
@@ -231,7 +244,7 @@ module VX_alu_int import VX_gpu_pkg::*; #(
                     2'b00: alu_result[i] = vote_result[i];
                     2'b01: alu_result[i] = shfl_result[i];
                     2'b10: alu_result[i] = wgather_result[i];
-                    default: alu_result[i] = vote_result[i];
+                    2'b11: alu_result[i] = packbf16_result[i];
                 endcase
             end else begin
                 case ({is_alu_w, op_class})
@@ -281,7 +294,7 @@ module VX_alu_int import VX_gpu_pkg::*; #(
     alu_header_t alu_hdr_in;
     always @(*) begin
         alu_hdr_in = execute_if.data.header;
-        if ((execute_if.data.op_args.alu.xtype == ALU_TYPE_OTHER) && alu_op[3]) begin
+        if ((execute_if.data.op_args.alu.xtype == ALU_TYPE_OTHER) && alu_op[3] && ~alu_op[2]) begin
             // WGATHER writes the FULL nibble (every non-source lane), regardless
             // of the active mask, so the gathered value is materialised even in
             // masked lanes — the consumer can then read any nibble lane under a

@@ -15,6 +15,8 @@
 #include <iostream>
 #include <iomanip>
 #include <string.h>
+#include <cstring>
+#include <cmath>
 #include <assert.h>
 #include <util.h>
 #include "debug.h"
@@ -54,6 +56,8 @@ uint32_t AluUnit::latency_of(const instr_trace_t* trace) const {
 	} else if (std::get_if<ShflType>(&trace->op_type)) {
 		return 2;
 	} else if (std::get_if<WgatherType>(&trace->op_type)) {
+		return 2;
+	} else if (std::get_if<PackBf16Type>(&trace->op_type)) {
 		return 2;
 	} else if (std::get_if<BrType>(&trace->op_type)) {
 		auto br_type = std::get<BrType>(trace->op_type);
@@ -327,6 +331,43 @@ void AluUnit::execute(instr_trace_t* trace) {
 			if      (offset == 1) rd_data[t].i = rs1_data[sl].i;
 			else if (offset == 2) rd_data[t].i = rs2_data[sl].i;
 			else if (offset == 3) rd_data[t].i = rs3_data[sl].i;
+		}
+	} else if (std::get_if<PackBf16Type>(&trace->op_type)) {
+		auto bf16_type = std::get<PackBf16Type>(trace->op_type);
+		for (uint32_t t = thread_start; t < num_threads; ++t) {
+			if (!tmask.test(t)) continue;
+			uint32_t a = rs1_data[t].i;
+			uint32_t b = rs2_data[t].i;
+			uint16_t a_lo = a & 0xFFFF, a_hi = (a >> 16) & 0xFFFF;
+			uint16_t b_lo = b & 0xFFFF, b_hi = (b >> 16) & 0xFFFF;
+			auto bf16_op = [&](uint16_t x, uint16_t y) -> uint16_t {
+				// Convert bf16 to float, operate in float, convert back
+				uint32_t xf = x << 16, yf = y << 16;
+				float fv_x, fv_y;
+				std::memcpy(&fv_x, &xf, 4);
+				std::memcpy(&fv_y, &yf, 4);
+				float result;
+				if (bf16_type == PackBf16Type::MUL)
+					result = fv_x * fv_y;
+				else
+					result = fv_x + fv_y;
+				// Handle NaN/Inf
+				if (std::isnan(result)) return 0x7FC0;
+				if (std::isinf(result)) return result > 0 ? 0x7F80 : 0xFF80;
+				// RNE rounding: convert float to bf16
+				uint32_t rf;
+				std::memcpy(&rf, &result, 4);
+				uint16_t bf16 = (rf >> 16) & 0xFFFF;
+				uint32_t lsb = (rf >> 16) & 1;
+				uint32_t round_bit = (rf >> 15) & 1;
+				uint32_t sticky = rf & 0x7FFF;
+				if (round_bit && (sticky || lsb))
+					bf16 += 1;
+				return bf16;
+			};
+			uint16_t r_lo = bf16_op(a_lo, b_lo);
+			uint16_t r_hi = bf16_op(a_hi, b_hi);
+			rd_data[t].i = (uint32_t(r_hi) << 16) | r_lo;
 		}
 	} else if (std::get_if<BrType>(&trace->op_type)) {
 		auto br_type = std::get<BrType>(trace->op_type);
