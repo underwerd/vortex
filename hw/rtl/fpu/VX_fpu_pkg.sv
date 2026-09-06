@@ -40,6 +40,10 @@ package VX_fpu_pkg;
 
     `DECL_EXECUTE_T (fpu, `VX_CFG_NUM_FPU_LANES);
 
+    // Math-SFU (ex2/tanh/sigmoid approx-class): warp packets sized to the
+    // shared Horner-lane array (VX_math_unit), independent of the FPU lanes.
+    `DECL_EXECUTE_T (math, `VX_CFG_NUM_MATH_LANES);
+
 endpackage
 
 `endif // VX_FPU_PKG_VH

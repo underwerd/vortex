@@ -558,6 +558,12 @@ enum class FpuType {
   FMVXW,
   FMVWX,
   FMINMAX,
+  // Math-SFU approx-class ops (S4): ex2.f32 / tanh.f32 / sigmoid.f32.
+  // Bit-exact image of the RTL datapath (fpu/VX_math_lane.sv); see the
+  // math_sfu namespace in fpu_unit.cpp.
+  EX2,
+  TANH,
+  SIGMOID,
 };
 
 struct IntrFpuArgs {
@@ -586,6 +592,9 @@ inline std::ostream &operator<<(std::ostream &os, const FpuType& type) {
   case FpuType::FMVXW:  os << "FMVXW"; break;
   case FpuType::FMVWX:  os << "FMVWX"; break;
   case FpuType::FMINMAX: os << "FMIN_MAX"; break;
+  case FpuType::EX2:     os << "EX2"; break;
+  case FpuType::TANH:    os << "TANH"; break;
+  case FpuType::SIGMOID: os << "SIGMOID"; break;
   default:
     assert(false);
   }

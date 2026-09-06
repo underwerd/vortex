@@ -416,6 +416,9 @@ void AluUnit::execute(instr_trace_t* trace) {
 			// ECALL / EBREAK: synchronous trap — redirect warp PC to mtvec.
 			case 0x000: sched.trigger_ecall(trace->wid, trace->PC);  break;
 			case 0x001: sched.trigger_ebreak(trace->wid, trace->PC); break;
+			// Illegal math-SFU encoding (decode-rejected ex2/tanh/sigmoid
+			// variants): mcause=2, mirrors RTL INST_BR_ILLEGAL_MATH.
+			case 0x003: sched.trigger_illegal(trace->wid, trace->PC); break;
 			// URET / SRET / MRET: trap return — restore warp PC from mepc.
 			case 0x002: case 0x102: case 0x302: sched.mret(trace->wid); break;
 			default: std::abort();

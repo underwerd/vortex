@@ -1,12 +1,16 @@
 // Packed BF16 (bfloat16) arithmetic: lane-wise mul and add on two
 // bf16 values packed per 32-bit word (lane 0 in [15:0], lane 1 in [31:16]).
 // bf16 = 1 sign + 8 exponent (bias 127) + 7 mantissa bits.
-// Round-to-nearest-even (RNE). Special cases follow IEEE-754 spirit.
+// Single-step round-to-nearest-even, gradual denormals, IEEE-754 style
+// special-case adjudication (see tests/cocotb/packbf16_unit/golden_model.py
+// for the bit-exact reference this implementation is verified against).
 
 `include "VX_define.vh"
 
 module VX_packbf16_arith #(
+    /* verilator lint_off UNUSEDPARAM */
     parameter `STRING INSTANCE_ID = "",
+    /* verilator lint_on UNUSEDPARAM */
     parameter NUM_LANES = 1
 ) (
     input  wire [NUM_LANES-1:0][`VX_CFG_XLEN-1:0] rs1,
@@ -31,8 +35,17 @@ module VX_packbf16_arith #(
         end
     end
 endmodule
+/* verilator lint_on DECLFILENAME */
 
-// Single bf16 operation: mul or add with RNE rounding.
+// Single bf16 operation: mul or add with single-step RNE rounding.
+//
+// Formulation: every finite non-zero input is decomposed to an exact
+// integer significand and power-of-two exponent (value = m * 2^e); the
+// operation produces an exact integer result (multiply) or a 12-bit
+// aligned sum with a sticky remainder (add), and one shared encoder
+// rounds that value to bf16 exactly once (RNE, gradual denormals,
+// overflow to infinity).
+/* verilator lint_off DECLFILENAME */
 module VX_bf16_op (
     input  wire [15:0] a,
     input  wire [15:0] b,
@@ -41,147 +54,215 @@ module VX_bf16_op (
 );
 
     // Decompose inputs
-    wire a_sign = a[15], b_sign = b[15];
-    wire [7:0] a_exp = a[14:7], b_exp = b[14:7];
-    wire [6:0] a_man = a[6:0],   b_man = b[6:0];
+    wire        a_sign = a[15], b_sign = b[15];
+    wire [7:0]  a_exp  = a[14:7], b_exp = b[14:7];
+    wire [6:0]  a_man  = a[6:0],  b_man = b[6:0];
 
-    wire a_zero = (a_exp == 0) && (a_man == 0);
-    wire b_zero = (b_exp == 0) && (b_man == 0);
-    wire a_inf  = (a_exp == 8'hFF) && (a_man == 0);
-    wire b_inf  = (b_exp == 8'hFF) && (b_man == 0);
-    wire a_nan  = (a_exp == 8'hFF) && (a_man != 0);
-    wire b_nan  = (b_exp == 8'hFF) && (b_man != 0);
-    wire a_denorm = (a_exp == 0) && (a_man != 0);
-    wire b_denorm = (b_exp == 0) && (b_man != 0);
+    wire a_zero   = (a_exp == 8'd0) && (a_man == 7'd0);
+    wire b_zero   = (b_exp == 8'd0) && (b_man == 7'd0);
+    wire a_inf    = (a_exp == 8'hFF) && (a_man == 7'd0);
+    wire b_inf    = (b_exp == 8'hFF) && (b_man == 7'd0);
+    wire a_nan    = (a_exp == 8'hFF) && (a_man != 7'd0);
+    wire b_nan    = (b_exp == 8'hFF) && (b_man != 7'd0);
+    wire a_denorm = (a_exp == 8'd0) && (a_man != 7'd0);
+    wire b_denorm = (b_exp == 8'd0) && (b_man != 7'd0);
 
-    // Effective significand: for normals, prepend implicit 1; for denormals, no implicit 1
-    wire [7:0] a_sig = a_denorm ? {1'b0, a_man} : {1'b1, a_man};
-    wire [7:0] b_sig = b_denorm ? {1'b0, b_man} : {1'b1, b_man};
+    // Unified exact representation: value = m * 2^e.
+    // Normal: m = 1.man (8b), e = exp - 134. Denormal: m = man (7b), e = -133
+    // (man * 2^-133 == 0.man * 2^-126). Both share the 2^-134 significand scale.
+    wire [7:0] a_m = a_denorm ? {1'b0, a_man} : {1'b1, a_man};
+    wire [7:0] b_m = b_denorm ? {1'b0, b_man} : {1'b1, b_man};
+    wire signed [9:0] a_e = a_denorm ? -10'sd133
+                                       : ($signed({2'b00, a_exp}) - 10'sd134);
+    wire signed [9:0] b_e = b_denorm ? -10'sd133
+                                       : ($signed({2'b00, b_exp}) - 10'sd134);
 
-    // --- MULTIPLY PATH ---
-    wire r_sign_mul = a_sign ^ b_sign;
-    wire [15:0] exp_sum = {7'd0, a_exp} + {7'd0, b_exp} - 16'd127;
-    wire [15:0] product = {8'd0, a_sig} * {8'd0, b_sig}; // up to 16 bits
+    // --- MULTIPLY PATH: exact 16-bit product ---
+    wire [15:0]          mul_m = a_m * b_m;           // exact, [1, 65025]
+    wire signed [10:0]   mul_e = a_e + b_e;           // [-268, 242]
 
-    // Find leading 1 in product for normalization
-    wire product_lz = ~product[15]; // 1 if leading bit is 0
-    wire [15:0] product_norm = product_lz ? (product << 1) : product;
-    wire [15:0] exp_mul = product_lz ? (exp_sum - 1) : exp_sum;
+    // --- ADD PATH: align the smaller exponent, 4 guard bits + sticky ---
+    // big/sml are chosen by magnitude, so e_gap >= 0 always.
+    wire a_ge_b = (a_e > b_e) || ((a_e == b_e) && (a_m >= b_m));
+    wire [7:0]         big_m = a_ge_b ? a_m : b_m;
+    wire [7:0]         sml_m = a_ge_b ? b_m : a_m;
+    wire signed [9:0]  big_e = a_ge_b ? a_e : b_e;
+    wire signed [9:0]  sml_e = a_ge_b ? b_e : a_e;
+    wire               eff_sub = a_sign ^ b_sign;
 
-    // Rounding: keep top 8 bits (sign+exp+7 mantissa), round from bit 7
-    wire [7:0] man_round_raw = product_norm[14:7];
-    wire round_bit_mul = product_norm[6];
-    wire sticky_mul = |product_norm[5:0];
-    wire [7:0] man_rounded_mul = man_round_raw + {7'd0, round_bit_mul & (sticky_mul | man_round_raw[0])};
+    wire [9:0] e_gap   = big_e - sml_e;               // 0..254
+    wire       gap_big = (e_gap > 10'd11);
+    wire [3:0] gap     = gap_big ? 4'd11 : e_gap[3:0];
 
-    // Check for mantissa overflow after rounding
-    wire man_carry_mul = (man_rounded_mul == 8'h80); // overflow into implicit bit position
-    wire [7:0] final_man_mul = man_carry_mul ? 8'h00 : man_rounded_mul[6:0];
-    wire [8:0] final_exp_mul = man_carry_mul ? (exp_mul + 1) : exp_mul[8:0];
+    wire [11:0] sml_ext = {sml_m, 4'd0};              // 12-bit aligned grid
+    wire [11:0] sml_shr = sml_ext >> gap;
+    // Any bit shifted out of the grid (including the whole operand when
+    // gap_big) makes the aligned value inexact.
+    wire lost = gap_big || (|(sml_ext & ((12'd1 << gap) - 12'd1)));
 
-    // --- ADD PATH ---
-    wire r_sign_add_raw = a_sign;
-    // Determine which operand has larger magnitude for add
-    wire [8:0] a_eff_exp = a_denorm ? 9'd1 : {1'b0, a_exp};
-    wire [8:0] b_eff_exp = b_denorm ? 9'd1 : {1'b0, b_exp};
+    wire [12:0] big_ext = {1'b0, big_m, 4'd0};
+    // Subtraction with truncation: the true difference is
+    // big_ext - sml_shr - frac with frac in (0,1) when lost; representing
+    // it as (big_ext - sml_shr - 1) + (1 - frac) keeps the remainder
+    // positive so a single sticky bit stays correct for RNE.
+    wire [12:0] add_sum = eff_sub
+        ? (lost ? (big_ext - {1'b0, sml_shr} - 13'd1)
+                : (big_ext - {1'b0, sml_shr}))
+        : (big_ext + {1'b0, sml_shr});
+    wire add_sticky = lost;
 
-    wire a_gt_b = (a_eff_exp > b_eff_exp) ||
-                  ((a_eff_exp == b_eff_exp) && (a_sig >= b_sig));
+    // big_ext/sml_shr live on a grid whose LSB weight is 2^(big_e-4):
+    // the 4 appended zeros extend 4 guard bits below big_m's LSB.
+    wire signed [10:0] add_e = big_e - 11'sd4;
+    wire add_sign = eff_sub ? (a_ge_b ? a_sign : b_sign) : a_sign;
 
-    wire [8:0]  big_exp  = a_gt_b ? a_eff_exp : b_eff_exp;
-    wire [8:0]  sml_exp  = a_gt_b ? b_eff_exp : a_eff_exp;
-    wire [7:0]  big_sig  = a_gt_b ? a_sig : b_sig;
-    wire [7:0]  sml_sig  = a_gt_b ? b_sig : a_sig;
-    wire        big_sign = a_gt_b ? a_sign : b_sign;
-    wire        sml_sign = a_gt_b ? b_sign : a_sign;
+    // --- SHARED ENCODER: round m * 2^e to bf16 exactly once ---
+    function automatic [4:0] highbit(input [16:0] m);
+        highbit = 5'd0;
+        for (int i = 0; i <= 16; ++i)
+            if (m[i]) highbit = i[4:0];
+    endfunction
 
-    wire [8:0] exp_diff = big_exp - sml_exp;
-    wire shift_clamped = (exp_diff > 9'd8) ? 1'b1 : 1'b0;
-    wire [3:0] shift_amt = shift_clamped ? 4'd8 : exp_diff[3:0];
-
-    // Align smaller significand
-    wire [7:0] sml_aligned = big_sig >> 0; // placeholder
-    wire [7:0] sml_shifted = sml_sig >> shift_amt;
-
-    // Add or subtract based on signs
-    wire do_subtract = big_sign ^ sml_sign;
-    wire [8:0] sum = do_subtract ?
-        ({1'b0, big_sig} - {1'b0, sml_shifted}) :
-        ({1'b0, big_sig} + {1'b0, sml_shifted});
-
-    wire r_sign_add = do_subtract ? big_sign : big_sign;
-    // For subtraction where result could be zero
-    wire sub_zero = do_subtract && (big_sig == sml_shifted);
-
-    // Normalize addition result
-    wire [8:0] sum_exp = big_exp;
-    wire sum_overflow = sum[8]; // carry out of addition
-    wire [8:0] norm_exp_add = sum_overflow ? (sum_exp + 1) : sum_exp;
-    wire [7:0] norm_man_add = sum_overflow ? sum[7:1] : sum[6:0];
-
-    // Normalize subtraction result (find leading 1)
-    reg [3:0] lz_count;
-    reg [7:0] norm_man_sub;
-    reg [8:0] norm_exp_sub;
-    always @(*) begin
-        lz_count = 0;
-        norm_man_sub = sum[6:0];
-        norm_exp_sub = sum_exp;
-        if (sum[6:0] != 0) begin
-            if (!sum[6]) begin
-                lz_count = 1;
-                if (!sum[5]) begin lz_count = 2;
-                if (!sum[4]) begin lz_count = 3;
-                if (!sum[3]) begin lz_count = 4;
-                if (!sum[2]) begin lz_count = 5;
-                if (!sum[1]) begin lz_count = 6;
-                if (!sum[0]) begin lz_count = 7;
-                end end end end end end
-            end
-            norm_man_sub = (sum[6:0] << lz_count);
-            norm_exp_sub = sum_exp - {5'd0, lz_count};
+    function automatic [15:0] bf16_encode(
+        input [16:0]         m,          // exact significand integer
+        input signed [10:0]  e,          // value = m * 2^e
+        input                sign,
+        input                sticky_in   // extra inexact remainder below m
+    );
+        /* verilator lint_off UNUSEDSIGNAL */
+        reg [4:0]          hb;
+        reg signed [11:0]  e_unb;        // unbiased exponent of the MSB
+        reg [4:0]          s;            // normalization shift amount
+        reg [7:0]          sig8;
+        reg                rnd;
+        reg                stk;
+        reg                carry;
+        reg signed [11:0]  e_fin;
+        reg [10:0]         kk_full;
+        reg [7:0]          kk;           // denormal right shift, 1..133
+        reg [18:0]         m_ext;
+        reg [18:0]         dm_sh;
+        reg [6:0]          dm_floor;
+        reg                rnd_d, stk_d;
+        reg [7:0]          dm_rne;
+        /* verilator lint_on UNUSEDSIGNAL */
+    begin
+        if (m == 17'd0) begin
+            // Exact cancellation (x + (-x) rounds to +0 under RNE).
+            bf16_encode = 16'h0000;
         end else begin
-            norm_man_sub = 0;
-            norm_exp_sub = 0;
+            hb    = highbit(m);
+            e_unb = $signed({{6{1'b0}}, hb[4:0]}) + $signed({e[10], e});
+            if (e_unb >= -12'sd126) begin
+                // Normal window: keep 8 significand bits, RNE the rest.
+                if (hb >= 5'd7) begin
+                    s = hb - 5'd7;                   // right shift 0..9
+                    if (s == 5'd0) begin
+                        sig8 = m[7:0];
+                        rnd  = 1'b0;
+                        stk  = sticky_in;
+                    end else begin
+                        sig8 = m[s+7 -: 8];
+                        rnd  = m[s-1];
+                        stk  = sticky_in
+                               || (|(m & ((17'd1 << (s-1)) - 17'd1)));
+                    end
+                end else begin
+                    // Massive cancellation left fewer than 8 significand
+                    // bits: left-normalize (exact, no rounding needed);
+                    // the sticky remainder stays meaningful below m.
+                    s = 5'd7 - hb;                   // left shift 1..7
+                    sig8 = {1'b0, m[6:0]} << s;    // fits 8 bits exactly
+                    rnd  = 1'b0;
+                    stk  = sticky_in;
+                end
+                // RNE increment; only a wrap 0xFF -> 0x00 means the
+                // mantissa carried into the exponent field.
+                carry = 1'b0;
+                if (rnd && (stk || sig8[0])) begin
+                    sig8  = sig8 + 8'd1;
+                    carry = (sig8 == 8'd0);
+                end
+                e_fin = e_unb + (carry ? 12'sd1 : 12'sd0);
+                if (e_fin > 12'sd127) begin
+                    bf16_encode = {sign, 8'hFF, 7'h00};   // overflow -> inf
+                end else begin
+                    // sig8 carries the implicit leading 1; only the 7
+                    // stored mantissa bits go into the encoding.
+                    bf16_encode = {sign, e_fin[7:0] + 8'd127, sig8[6:0]};
+                end
+            end else begin
+                // Denormal window: integer denormal mantissa is
+                // dm = m * 2^(e+133); here e <= -134 always (for multiply
+                // e = -268..-134 below the normal window cutoff given
+                // m >= 128, for add e = -137), so kk = -(e+133) >= 1.
+                kk_full = -(e + 11'sd133);
+                // Any bit above 19 shifts means the value is far below
+                // half the smallest denormal; clamp to the >19 branch.
+                kk      = (kk_full > 11'd19) ? 8'd20 : kk_full[7:0];
+                m_ext   = {2'b00, m};
+                if (kk > 8'd19) begin
+                    // Value is below half of the smallest denormal and
+                    // cannot tie: rounds to zero.
+                    dm_floor = 7'd0;
+                    rnd_d    = 1'b0;
+                    stk_d    = 1'b1;
+                end else begin
+                    dm_sh   = m_ext >> kk;
+                    dm_floor = dm_sh[6:0];
+                    rnd_d    = m_ext[kk-1];
+                    stk_d    = sticky_in
+                               || (|(m_ext & ((19'd1 << (kk-1)) - 19'd1)));
+                end
+                dm_rne = {1'b0, dm_floor}
+                         + ((rnd_d && (stk_d || dm_floor[0])) ? 8'd1 : 8'd0);
+                if (dm_rne == 8'd128) begin
+                    // Rounded up into the smallest normal.
+                    bf16_encode = {sign, 8'd1, 7'd0};
+                end else begin
+                    bf16_encode = {sign, 8'd0, dm_rne[6:0]};
+                end
+            end
         end
     end
+    endfunction
 
-    wire [8:0] final_exp_add = do_subtract ? norm_exp_sub : norm_exp_add;
-    wire [6:0] final_man_add_raw = do_subtract ? norm_man_sub[6:0] : norm_man_add[6:0];
+    wire [16:0] m_mul = {1'b0, mul_m};
+    wire [16:0] m_add = {4'd0, add_sum};
 
-    // --- SELECT MUL or ADD result ---
-    wire [7:0] r_exp  = is_add ? final_exp_add[7:0] : final_exp_mul[7:0];
-    wire [6:0] r_man  = is_add ? final_man_add_raw  : final_man_mul[6:0];
-    wire       r_sign = is_add ? (sub_zero ? 1'b0 : r_sign_add) : r_sign_mul;
-
-    // --- SPECIAL CASES ---
-    wire any_nan = a_nan || b_nan;
-    wire inf_times_zero = is_add ? 1'b0 : ((a_inf && b_zero) || (b_inf && a_zero));
-    wire inf_result = is_add ?
-        (a_inf || b_inf) :
-        (a_inf || b_inf || (final_exp_mul[8] && !final_exp_mul[7])); // overflow to inf
-
+    // --- SPECIAL CASES + RESULT SELECT ---
     always @(*) begin
-        if (any_nan || inf_times_zero) begin
-            out = 16'h7FC0; // qNaN
-        end else if (inf_result) begin
-            out = {r_sign, 8'hFF, 7'h00}; // infinity
-        end else if (a_zero && b_zero && !is_add) begin
-            out = 16'h0000; // 0 * 0 = 0
-        end else if (a_zero || b_zero) begin
-            if (is_add)
-                out = a_zero ? b : a; // 0 + x = x
-            else
-                out = {r_sign, 15'd0}; // x * 0 = 0 (with sign)
-        end else if (sub_zero) begin
-            out = 16'h0000; // exact cancellation
-        end else if (r_exp == 0 || r_exp[8]) begin
-            // Underflow: denormal or zero
-            out = {r_sign, 8'h00, r_man}; // simplified: flush to zero-ish
-        end else if (r_exp == 8'hFF) begin
-            out = {r_sign, 8'hFF, 7'h00}; // overflow to inf
+        if (a_nan || b_nan) begin
+            out = 16'h7FC0;                            // qNaN
+        end else if (!is_add) begin
+            // multiply
+            if ((a_inf && b_zero) || (b_inf && a_zero)) begin
+                out = 16'h7FC0;                        // inf * 0 -> qNaN
+            end else if (a_inf || b_inf) begin
+                out = {a_sign ^ b_sign, 8'hFF, 7'h00}; // inf * finite
+            end else if (a_zero || b_zero) begin
+                out = {a_sign ^ b_sign, 15'd0};        // signed zero product
+            end else begin
+                out = bf16_encode(m_mul, mul_e, a_sign ^ b_sign, 1'b0);
+            end
         end else begin
-            out = {r_sign, r_exp[7:0], r_man};
+            // add
+            if (a_inf && b_inf) begin
+                out = (a_sign == b_sign) ? {a_sign, 8'hFF, 7'h00}
+                                         : 16'h7FC0;   // inf - inf -> qNaN
+            end else if (a_inf) begin
+                out = a;
+            end else if (b_inf) begin
+                out = b;
+            end else if (a_zero && b_zero) begin
+                out = (a_sign == b_sign) ? {a_sign, 15'd0} : 16'h0000;
+            end else if (a_zero) begin
+                out = b;                               // x + 0 = x
+            end else if (b_zero) begin
+                out = a;
+            end else begin
+                out = bf16_encode(m_add, add_e, add_sign, add_sticky);
+            end
         end
     end
 endmodule

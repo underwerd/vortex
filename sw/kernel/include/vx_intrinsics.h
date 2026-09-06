@@ -584,6 +584,52 @@ inline uint32_t vx_packbf16_add(uint32_t a, uint32_t b) {
     return out;
 }
 
+// Math-SFU approx-class ops (OP-FP, R-type rd = op(rs1), rs2 = x0).
+// funct5 slots after FSQRT: ex2=01100, tanh=01101, sigmoid=01110;
+// fmt=00; frm is accepted and ignored (000-100, 111), 101/110 and any
+// rs2!=x0 / fmt!=00 encoding trap as illegal instruction (mcause=2).
+#define RISCV_OP_FP 0x53
+
+#define VX_MATH_FUNCT7_EX2     0x30
+#define VX_MATH_FUNCT7_TANH    0x34
+#define VX_MATH_FUNCT7_SIGMOID 0x38
+
+#define _vx_math_insn(funct7, frm, a) ({                        \
+    float __out;                                                \
+    __asm__ volatile (                                          \
+        ".insn r %2, %1, %3, %0, %4, x0"                        \
+        : "=f"(__out) : "i"(frm), "i"(RISCV_OP_FP), "i"(funct7), "f"(a)); \
+    __out;                                                      \
+})
+
+__attribute__((always_inline))
+inline float vx_ex2(float a) {
+    return _vx_math_insn(VX_MATH_FUNCT7_EX2, 0, a);
+}
+
+__attribute__((always_inline))
+inline float vx_tanh(float a) {
+    return _vx_math_insn(VX_MATH_FUNCT7_TANH, 0, a);
+}
+
+__attribute__((always_inline))
+inline float vx_sigmoid(float a) {
+    return _vx_math_insn(VX_MATH_FUNCT7_SIGMOID, 0, a);
+}
+
+// Raw-encoding probes: explicit frm / nonzero rs2, for illegal-encoding
+// and frm-equivalence testing.
+#define _vx_math_insn_frm(funct7, frm, a) _vx_math_insn(funct7, frm, a)
+
+#define _vx_math_insn_rs2(funct7, a, rs2) ({                    \
+    float __out;                                                \
+    uint32_t __rs2 = (rs2);                                     \
+    __asm__ volatile (                                          \
+        ".insn r %2, 0, %3, %0, %4, %5"                         \
+        : "=f"(__out) : "i"(RISCV_OP_FP), "i"(funct7), "f"(a), "r"(__rs2)); \
+    __out;                                                      \
+})
+
 #ifdef __cplusplus
 }
 #endif

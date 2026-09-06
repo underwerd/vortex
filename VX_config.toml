@@ -125,6 +125,25 @@ VX_CFG_FSQRT_PE_RATIO= 1
 VX_CFG_FCVT_PE_RATIO = 1
 VX_CFG_FNCP_PE_RATIO = 1
 
+[math]
+# Math-SFU (ex2/tanh/sigmoid approx-class, EXT_F-gated). Lanes = shared
+# 13-stage Horner array width per PE; a warp is dispatched in
+# SIMD_WIDTH/NUM_MATH_LANES packets (one packet per cycle), so a 16-thread
+# warp on 8 lanes sustains one warp every 2 cycles with full pipelining.
+VX_CFG_NUM_MATH_LANES = "expr: min($VX_CFG_SIMD_WIDTH, 8)"
+# In-flight packet headers (tag queue depth), mirrors the FPU queue sizing.
+VX_CFG_MATH_QUEUE_SIZE = "expr: 2 * ($VX_CFG_SIMD_WIDTH // $VX_CFG_NUM_MATH_LANES)"
+# End-to-end math pipeline latency seen by the serializer: the VX_math_lane
+# 34-stage array (S1 classify .. S34 finalize fold; the Horner array runs
+# two cycles per k step, the S2 pre-multiply is split across two cycles,
+# the finalize tail multipliers get their own cycle, and the packer is
+# split because single stages measured well past the 2.5 ns budget at
+# 400 MHz) plus the
+# 1-cycle lane_enable register in VX_math_unit that
+# decouples the serializer's combinational backpressure from the lane's
+# enable-gated stage muxes (V4b R1 fix).
+VX_CFG_MATH_LATENCY = 35
+
 [amo]
 # LR/SC reservation stations per LLC bank; line-indexed in BRAM, eviction yields legal spurious SC failures
 VX_CFG_AMO_RS_SIZE = "expr: max($VX_CFG_NUM_WARPS, up($VX_CFG_NUM_CORES * $VX_CFG_NUM_WARPS / $VX_CFG_L2_NUM_BANKS))"

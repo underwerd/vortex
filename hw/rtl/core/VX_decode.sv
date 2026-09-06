@@ -510,6 +510,35 @@ module VX_decode import
                         `USED_FREG (rd);
                         `USED_FREG (rs1);
                     end
+                    5'b01100, // EX2
+                    5'b01101, // TANH
+                    5'b01110: begin // SIGMOID
+                        // Math-SFU approx-class instructions. GPU SFU
+                        // convention: all 5 defined frm values (000-100, 111)
+                        // are accepted and ignored; no fflags are produced.
+                        if (rs2 != 5'b00000 || funct2 != 2'b00 || (funct3 == 3'b101) || (funct3 == 3'b110)) begin
+                            // Illegal encoding (rs2!=0, fmt!=00/f64, or
+                            // reserved frm 101/110): trap as illegal
+                            // instruction (mcause=2) via the ALU trap path.
+                            ex_type = EX_ALU;
+                            op_type = INST_OP_BITS'(INST_BR_ILLEGAL_MATH);
+                            op_args.br.xtype  = ALU_TYPE_BRANCH;
+                            op_args.br.use_imm= 1;
+                            op_args.br.use_PC = 1;
+                            op_args.br.imm20  = 20'd4;
+                            op_args.br.is_rvc = decode_is_rvc;
+                            wr_xregs[XREG_0] = 1'b0;
+                            is_wstall = 1;
+                        end else begin
+                            ex_type = EX_MATH;
+                            op_type = INST_OP_BITS'((funct5 == 5'b01100) ? INST_FPU_EX2 :
+                                                    (funct5 == 5'b01101) ? INST_FPU_TANH :
+                                                                           INST_FPU_SIGMOID);
+                            wr_xregs[XREG_0] = 1'b0; // no fflags on approx-class ops
+                            `USED_FREG (rd);
+                            `USED_FREG (rs1);
+                        end
+                    end
                     5'b10100: begin
                         // FCMP
                         op_type = INST_OP_BITS'(INST_FPU_CMP);
@@ -737,6 +766,11 @@ module VX_decode import
                         ex_type = EX_ALU;
                         op_args.alu.xtype = ALU_TYPE_OTHER;
                         op_args.alu.is_w  = 0;
+                        // R-type: the operand mux in VX_alu_int reads use_imm;
+                        // leaving it at the 'x default lets the simulator fold
+                        // it to 1 and feed a garbage imm20 to rs2.
+                        op_args.alu.use_PC = 0;
+                        op_args.alu.use_imm = 0;
                         `USED_IREG (rd);
                         `USED_IREG (rs1);
                         `USED_IREG (rs2);

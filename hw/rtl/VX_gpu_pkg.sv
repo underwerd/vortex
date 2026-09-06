@@ -230,7 +230,10 @@ package VX_gpu_pkg;
     localparam EX_LSU = 1;
     localparam EX_SFU = 2;
     localparam EX_FPU = (EX_SFU + `VX_CFG_EXT_F_ENABLED);
-    localparam EX_TCU = (EX_FPU + `VX_CFG_EXT_TCU_ENABLED);
+    // Math-SFU (ex2/tanh/sigmoid) unit. Tracks EXT_F: the instructions live
+    // in the OP-FP space, so without EXT_F the slot folds away like EX_FPU.
+    localparam EX_MATH = (EX_FPU + `VX_CFG_EXT_F_ENABLED);
+    localparam EX_TCU = (EX_MATH + `VX_CFG_EXT_TCU_ENABLED);
 
     localparam NUM_EX_UNITS = EX_TCU + 1;
     localparam EX_BITS = `CLOG2(NUM_EX_UNITS);
@@ -355,6 +358,11 @@ package VX_gpu_pkg;
     localparam INST_BR_SRET =    4'b1101;
     localparam INST_BR_MRET =    4'b1110;
     localparam INST_BR_OTHER =   4'b1111;
+    // Decode-rejected math-SFU encodings (rs2!=0/fmt!=00/frm reserved) trap
+    // through the ALU synchronous-trap path with mcause=2 (illegal instruction).
+    // 0011 is free in the branch opcode space (BEQ=0000, BNE=0010; op[3]=0 so
+    // it stays in the compare class and never aliases JAL/JALR/RET encodings).
+    localparam INST_BR_ILLEGAL_MATH = 4'b0011;
     localparam INST_BR_BITS =    4;
 
     function automatic logic [1:0] inst_br_class(input logic [INST_BR_BITS-1:0] op);
@@ -484,6 +492,12 @@ package VX_gpu_pkg;
     localparam INST_FPU_CMP =    4'b1100; // frm: LE=0, LT=1, EQ=2
     localparam INST_FPU_F2F =    4'b1101; // fmt[0]: F32=0, F64=1
     localparam INST_FPU_MISC =   4'b1110; // frm: SGNJ=0, SGNJN=1, SGNJX=2, CLASS=3, MVXW=4, MVWX=5, FMIN=6, FMAX=7
+    // Math-SFU ops (ex2/tanh/sigmoid.f32). 0110/0111/1111 are the last free
+    // op_type slots: 1100-1110 are taken by CMP/F2F/MISC, so sigmoid takes
+    // 1111 (the spec draft had 1100, which collides with INST_FPU_CMP).
+    localparam INST_FPU_EX2 =    4'b0110; // 2^x, f32 lane-wise
+    localparam INST_FPU_TANH =   4'b0111; // tanh(x), f32 lane-wise
+    localparam INST_FPU_SIGMOID = 4'b1111; // 1/(1+e^-x), f32 lane-wise
     localparam INST_FPU_BITS =   4;
 
     function automatic logic inst_fpu_is_class(input logic [INST_FPU_BITS-1:0] op, input logic [INST_FRM_BITS-1:0] frm);

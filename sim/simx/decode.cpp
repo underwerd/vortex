@@ -747,6 +747,25 @@ Instr::Ptr Decoder::decode(uint32_t code, uint64_t uuid) {
       instr->set_dest_reg(rd, RegType::Float);
       instr->set_src_reg(0, rs1, RegType::Float);
       break;
+    case 0x30: case 0x31: // Math-SFU: EX2.S (fmt ignored, f32 datapath)
+    case 0x34: case 0x35: // Math-SFU: TANH.S
+    case 0x38: case 0x39: // Math-SFU: SIGMOID.S
+      // Mirrors VX_decode.sv: keyed on funct5; rs2!=0, funct2!=00 or
+      // reserved frm 101/110 trap as illegal instruction (mcause=2)
+      // through the ALU SYS path (RTL INST_BR_ILLEGAL_MATH).
+      if (rs2 != 0 || funct2 != 0 || funct3 == 5 || funct3 == 6) {
+        instr->set_fu_type(FUType::ALU);
+        instr->set_op_type(BrType::SYS);
+        instr->set_args(IntrBrArgs{0, 0, 0x003});
+        instr->set_wstall(true);
+      } else {
+        instr->set_op_type((funct7 == 0x30 || funct7 == 0x31) ? FpuType::EX2 :
+                           (funct7 == 0x34 || funct7 == 0x35) ? FpuType::TANH :
+                                                                FpuType::SIGMOID);
+        instr->set_dest_reg(rd, RegType::Float);
+        instr->set_src_reg(0, rs1, RegType::Float);
+      }
+      break;
     case 0x50: // FLE.S, FLT.S, FEQ.S
     case 0x51: // FLE.D, FLT.D, FEQ.D
       instr->set_op_type(FpuType::FCMP);

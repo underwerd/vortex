@@ -2,10 +2,15 @@
 #include <unistd.h>
 #include <string.h>
 #include <vector>
+#include <cmath>
 #include <vortex2.h>
 #include "common.h"
 
-#define FLOAT_ULP 10
+// The kernel composes exp on the math-SFU ex2 instruction (2^-13 relative
+// contract). Through the row sum the softmax output relative error is bounded
+// by the numerator bound plus the denominator bound: 2^-13 + 2^-13 = 2^-12.
+#define REL_BOUND 2.44140625e-4f
+#define ABS_FLOOR 1e-9f
 
 #define RT_CHECK(_expr)                                         \
    do {                                                         \
@@ -54,14 +59,11 @@ public:
     return static_cast<float>(rand()) / RAND_MAX;
   }
   static bool compare(float a, float b, int index, int errors) {
-    union fi_t { float f; int32_t i; };
-    fi_t fa, fb;
-    fa.f = a;
-    fb.f = b;
-    auto d = std::abs(fa.i - fb.i);
-    if (d > FLOAT_ULP) {
+    float diff = std::abs(a - b);
+    float tol = std::max(REL_BOUND * std::abs(b), ABS_FLOOR);
+    if (diff > tol) {
       if (errors < 100) {
-        printf("*** error: [%d] expected=%f, actual=%f\n", index, b, a);
+        printf("*** error: [%d] expected=%.9g, actual=%.9g\n", index, b, a);
       }
       return false;
     }
@@ -226,11 +228,11 @@ int main(int argc, char *argv[]) {
     }
 
     for(uint32_t k = 0; k < num_cols; k++){
-        sum += exp(h_src0[tid + k] - max);
+        sum += std::exp((double)(h_src0[tid + k] - max));
     }
 
     for(uint32_t k = 0; k < num_cols; k++){
-        auto ref = exp(h_src0[tid + k] - max) / sum;
+        auto ref = std::exp((double)(h_src0[tid + k] - max)) / sum;
         auto cur = h_dst[tid + k];
 
         if (!Comparator<TYPE>::compare(cur, ref, i, errors)) {

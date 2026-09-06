@@ -33,6 +33,7 @@ package VX_trace_pkg;
             EX_SFU: `TRACE(level, ("SFU"))
         `ifdef VX_CFG_EXT_F_ENABLE
             EX_FPU: `TRACE(level, ("FPU"))
+            EX_MATH: `TRACE(level, ("MATH"))
         `endif
         `ifdef VX_CFG_EXT_TCU_ENABLE
             EX_TCU: `TRACE(level, ("TCU"))
@@ -137,6 +138,7 @@ package VX_trace_pkg;
                         INST_BR_JALR:  `TRACE(level, ("JALR"))
                         INST_BR_ECALL: `TRACE(level, ("ECALL"))
                         INST_BR_EBREAK:`TRACE(level, ("EBREAK"))
+                        INST_BR_ILLEGAL_MATH: `TRACE(level, ("ILLEGAL"))
                         INST_BR_URET:  `TRACE(level, ("URET"))
                         INST_BR_SRET:  `TRACE(level, ("SRET"))
                         INST_BR_MRET:  `TRACE(level, ("MRET"))
@@ -430,6 +432,16 @@ package VX_trace_pkg;
     `ifdef VX_CFG_EXT_TCU_ENABLE
         EX_TCU: begin
             VX_tcu_pkg::trace_ex_op(level, op_type, op_args);
+        end
+    `endif
+    `ifdef VX_CFG_EXT_F_ENABLE
+        EX_MATH: begin
+            case (INST_FPU_BITS'(op_type))
+                INST_FPU_EX2: `TRACE(level, ("EX2.S"))
+                INST_FPU_TANH: `TRACE(level, ("TANH.S"))
+                INST_FPU_SIGMOID: `TRACE(level, ("SIGMOID.S"))
+                default: `TRACE(level, ("?"))
+            endcase
         end
     `endif
         default: `TRACE(level, ("?"))

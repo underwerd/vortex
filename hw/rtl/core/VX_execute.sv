@@ -122,6 +122,15 @@ module VX_execute import VX_gpu_pkg::*; #(
         .commit_if      (commit_if[EX_FPU * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH]),
         .fpu_csr_if     (fpu_csr_if)
     );
+
+    VX_math_unit #(
+        .INSTANCE_ID (`SFORMATF(("%s-math", INSTANCE_ID)))
+    ) math_unit (
+        .clk            (clk),
+        .reset          (reset),
+        .dispatch_if    (dispatch_if[EX_MATH * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH]),
+        .commit_if      (commit_if[EX_MATH * `VX_CFG_ISSUE_WIDTH +: `VX_CFG_ISSUE_WIDTH])
+    );
 `endif
 
 `ifdef VX_CFG_EXT_TCU_ENABLE
