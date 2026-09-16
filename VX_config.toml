@@ -45,7 +45,7 @@ VX_CFG_VLEN = "expr: $VX_CFG_XLEN * 4"
 
 [pipeline]
 VX_CFG_NUM_WARPS = 4
-VX_CFG_NUM_THREADS = 4
+VX_CFG_NUM_THREADS = 32
 VX_CFG_NUM_BARRIERS = 8
 VX_CFG_MAX_BAR_EVENTS = 32
 
@@ -319,10 +319,11 @@ VX_CFG_RTU_FDIV_LATENCY    = "expr: 28 if $VIVADO else (15 if $QUARTUS else 17)"
 # ray's live BVH walk. The two are independent axes: slots buy residency,
 # contexts buy traversal parallelism. Slots partition statically across the
 # cores an RTU serves (CORES_PER_RTU = SOCKET_SIZE / NUM_RTU_CORES), so the
-# count must be a whole multiple of that — the expression below is one slot per
-# core at every socket size. A kernel that keeps more traces in flight per warp
-# than its core owns slots needs a larger pool (see tests/raytracing).
-VX_CFG_RTU_NUM_SLOTS       = "expr: $VX_CFG_SOCKET_SIZE / $VX_CFG_NUM_RTU_CORES"
+# count must be a whole multiple of that. A kernel that keeps more traces in
+# flight per warp than its core owns slots needs a larger pool (see
+# tests/raytracing). Pinned to 4: the warp-granular residency baseline (4 warp
+# buffers, NUM_CTX = 4 x NUM_THREADS ray contexts).
+VX_CFG_RTU_NUM_SLOTS       = 4
 # In-flight ray contexts. DERIVED, not a free knob: a SLOT OWNS ITS CONTEXTS (one per
 # thread of the warp it is tracing), so the two cannot be set independently. They used to
 # be, and the "extra contexts idle" configuration that allowed was a machine in which

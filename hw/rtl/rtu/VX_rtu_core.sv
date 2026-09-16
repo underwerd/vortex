@@ -131,6 +131,13 @@ module VX_rtu_core import VX_gpu_pkg::*, VX_rtu_pkg::*; #(
     localparam STG_IDX_W = `LOG2UP(NUM_STG);
     localparam RAY_IDX_W = `CLOG2(RTU_RAY_BEATS);
 
+    // A warp WAITs for its trace before arming another, and staging is keyed by
+    // {src, wid}, so at most NUM_STG traces can ever be waiting for a slot.
+    // Slots past that are unreachable; the coupling is invisible unless a config
+    // that breaks it fails the build.
+    `STATIC_ASSERT((NUM_SLOTS <= NUM_STG),
+        ("RTU_NUM_SLOTS must not exceed NUM_SRCS * NUM_WARPS: a warp holds at most one trace in flight"))
+
     reg [NUM_STG-1:0]                stg_armed;   // the arm's scalars are here
     reg [NUM_STG-1:0]                stg_full;    // all RTU_RAY_BEATS words are here
     reg [NUM_STG-1:0][RAY_IDX_W-1:0] stg_beat;    // ray beats landed so far
@@ -766,39 +773,62 @@ module VX_rtu_core import VX_gpu_pkg::*, VX_rtu_pkg::*; #(
 `ifdef DBG_RTU_OCC
     longint unsigned occ_total, occ_busy, occ_write, occ_cb, occ_fill;
     longint unsigned occ_idle_ray_waiting, occ_idle_starved, occ_traces;
+    // Per-cycle slot concurrency: how many slots are simultaneously non-IDLE.
+    // This is the direct answer to "can all NUM_SLOTS warp-buffers be in flight
+    // at once" -- occ_hist[k] counts cycles with exactly k slots occupied and
+    // occ_max is the peak. A slot is live whenever tstate[s] != T_IDLE, which
+    // spans FILL/BUSY/WRITE and every callback/resume wait state.
+    longint unsigned occ_hist [0:NUM_SLOTS];
+    longint unsigned occ_conc_sum, occ_max;
     always @(posedge clk) begin
         if (reset) begin
             occ_total <= 0; occ_busy <= 0; occ_write <= 0; occ_cb <= 0;
             occ_fill <= 0; occ_idle_ray_waiting <= 0; occ_idle_starved <= 0;
-            occ_traces <= 0;
+            occ_traces <= 0; occ_conc_sum <= 0; occ_max <= 0;
+            for (integer k = 0; k <= NUM_SLOTS; k = k + 1) occ_hist[k] <= 0;
         end else begin
-            occ_total <= occ_total + 1;
-            if (ss_valid) begin
-                occ_traces <= occ_traces + 1;
-            end
+            // One non-blocking assignment per counter per cycle: `<=` inside the
+            // slot loop collapses to the last slot's write, which would silently
+            // degrade every per-state counter to "cycles with >=1 slot in state".
+            longint unsigned conc, n_busy, n_write, n_cb, n_fill, n_iwait, n_istarve;
+            conc = 0; n_busy = 0; n_write = 0; n_cb = 0; n_fill = 0;
+            n_iwait = 0; n_istarve = 0;
             for (integer s = 0; s < NUM_SLOTS; s = s + 1) begin
                 case (tstate[s])
-                T_BUSY:   occ_busy  <= occ_busy + 1;
-                T_WRITE:  occ_write <= occ_write + 1;
-                T_FILL:   occ_fill  <= occ_fill + 1;
-                T_CBWAIT, T_CBATTR, T_RESUME, T_RWAIT: occ_cb <= occ_cb + 1;
+                T_BUSY:   n_busy  = n_busy + 1;
+                T_WRITE:  n_write = n_write + 1;
+                T_FILL:   n_fill  = n_fill + 1;
+                T_CBWAIT, T_CBATTR, T_RESUME, T_RWAIT: n_cb = n_cb + 1;
                 T_IDLE: begin
-                    if ((| stg_ready) || (fstate == F_RUN)) begin
-                        occ_idle_ray_waiting <= occ_idle_ray_waiting + 1;
-                    end else begin
-                        occ_idle_starved <= occ_idle_starved + 1;
-                    end
+                    if ((| stg_ready) || (fstate == F_RUN)) n_iwait   = n_iwait + 1;
+                    else                                    n_istarve = n_istarve + 1;
                 end
                 default:;
                 endcase
+                if (tstate[s] != T_IDLE) conc = conc + 1;
             end
+            occ_total            <= occ_total + 1;
+            occ_busy             <= occ_busy + n_busy;
+            occ_write            <= occ_write + n_write;
+            occ_cb               <= occ_cb + n_cb;
+            occ_fill             <= occ_fill + n_fill;
+            occ_idle_ray_waiting <= occ_idle_ray_waiting + n_iwait;
+            occ_idle_starved     <= occ_idle_starved + n_istarve;
+            if (ss_valid) begin
+                occ_traces <= occ_traces + 1;
+            end
+            occ_conc_sum   <= occ_conc_sum + conc;
+            occ_hist[conc] <= occ_hist[conc] + 1;
+            if (conc > occ_max) occ_max <= conc;
         end
     end
     always @(posedge clk) begin
-        if (!reset && (occ_total % 40000 == 39999)) begin
-            $display("RTU-OCC @%0d: traces=%0d | busy=%0d write=%0d cb=%0d fill=%0d | IDLE_ray_waiting=%0d IDLE_STARVED=%0d",
+        if (!reset && (occ_total % 5000 == 4999)) begin
+            $display("RTU-OCC @%0d: traces=%0d busy=%0d write=%0d cb=%0d fill=%0d idle_raywait=%0d idle_starved=%0d | CONC max=%0d avg=%0d.%02d hist0..%0d=%0d/%0d/%0d/%0d/%0d",
                 occ_total, occ_traces, occ_busy, occ_write, occ_cb, occ_fill,
-                occ_idle_ray_waiting, occ_idle_starved);
+                occ_idle_ray_waiting, occ_idle_starved,
+                occ_max, occ_conc_sum / occ_total, (occ_conc_sum * 100 / occ_total) % 100,
+                NUM_SLOTS, occ_hist[0], occ_hist[1], occ_hist[2], occ_hist[3], occ_hist[4]);
         end
     end
 `endif

@@ -1651,7 +1651,9 @@ package VX_gpu_pkg;
     localparam RTCACHE_ADDR_WIDTH    = (`VX_CFG_MEM_ADDR_WIDTH - `CLOG2(RTCACHE_WORD_SIZE));
     localparam RTCACHE_LINE_SIZE     = `VX_CFG_L1_LINE_SIZE;
     localparam RTCACHE_NUM_REQS      = 1;
-    localparam RTCACHE_TAG_ID_BITS   = `CLOG2(`VX_CFG_RTCACHE_MSHR_SIZE);
+    // Core-tag field carries the RTU's per-context fetch tag (MERGE_DEPTH=0:
+    // one request per context per fetch), so it must fit CLOG2(RTU_NUM_CTX).
+    localparam RTCACHE_TAG_ID_BITS   = `MAX(`CLOG2(`VX_CFG_RTCACHE_MSHR_SIZE), `CLOG2(`VX_CFG_RTU_NUM_CTX));
     localparam RTCACHE_TAG_WIDTH     = (UUID_WIDTH + RTCACHE_TAG_ID_BITS);
     localparam RTCACHE_BUS_TAG_WIDTH = (RTCACHE_TAG_WIDTH + 1);
     localparam RTCACHE_MEM_DATA_WIDTH= (RTCACHE_LINE_SIZE * 8);
