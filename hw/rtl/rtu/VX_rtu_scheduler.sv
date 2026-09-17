@@ -42,63 +42,86 @@
 // back. A structural conflict (memory port busy, a full queue) re-arms the
 // wake bit and retries — there is no stall network.
 //
-// Results leave through the window store: a {slot, word} row RAM holding the
+// Results leave through the window store: a {cohort, word} row RAM holding the
 // committed-hit and candidate records one field-row (all lanes) per word, so
-// the core's record write-back is a row-address counter. A commit engine
-// serializes hit commits and candidate stagings into it; a barrier walker runs
-// the per-slot finalise (CHS/MISS staging) and resume (candidate accept)
-// copies one row at a time.
+// the core's record write-back is an address counter over those rows. A commit
+// engine serializes hit commits and candidate stagings into it; a barrier
+// walker runs the per-cohort finalise (CHS/MISS staging) and resume (candidate
+// accept) copies one row at a time.
+//
+// Two index spaces, bridged by ctx_meta (written at launch):
+//   WALKER space — ctx id: the FSM, the arbiter, every context-indexed RAM
+//                  (ctx/ray/fbuf/trires/xfres/recipres/stack) and the wake
+//                  vector. A ctx is a pool resource: released the cycle its
+//                  walk terminates, reallocatable to any cohort.
+//   RECORD space — {cohort, pos}: the record flags (mask/done/hit/yld/cbtype/
+//                  attr/act) and every cohort-range scan (all_done, the fin/res
+//                  masks, the core's write-back reads). A record slot lives
+//                  until its cohort's record has been written back.
+// EXEC reads/writes the flags through rec_q, pipelined beside sel_q, so the
+// early release of a ctx can never disturb a pending record.
 
 `include "VX_define.vh"
 
 module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     parameter `STRING INSTANCE_ID = "",
-    parameter NUM_SLOTS = 1,
-    parameter NUM_CTX   = 4,
+    parameter NUM_COHORTS = 1,
+    parameter NUM_LANES   = 4,
+    parameter NUM_CTX     = 4,
     parameter LINE_BITS = `VX_CFG_MEM_BLOCK_SIZE * 8,
     parameter CTX_TAG_W = `LOG2UP(NUM_CTX)
 ) (
     input  wire clk,
     input  wire reset,
 
-    // ── slot launch (from the core's fill engine) ─────────────────────
-    // slot_start arms the slot (mask + warp-uniform ray scalars) before any of
-    // its rays land; each lane's ray then arrives on ray_wr, which is also that
-    // context's launch: it starts traversing while later lanes still stream in.
-    input  wire                              slot_start_valid,
-    input  wire [`LOG2UP(NUM_SLOTS)-1:0]     slot_start_slot,
-    input  wire [(NUM_CTX/NUM_SLOTS)-1:0]    slot_start_mask,
-    input  wire [15:0]                       slot_start_flags,
-    input  wire [15:0]                       slot_start_cull,
-    input  wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] slot_start_scene,
+    // ── cohort launch (from the core's drain sequencer) ───────────────
+    // cohort_start arms the cohort's record space (mask + warp-uniform ray
+    // scalars) before any of its rays land; each ray then arrives on ray_wr
+    // with its pool ctx id and record slot {cohort, pos} — that write is the
+    // context's launch: it starts traversing while later rays still stream in.
+    input  wire                              cohort_start_valid,
+    input  wire [`LOG2UP(NUM_COHORTS)-1:0]   cohort_start_cohort,
+    input  wire [NUM_LANES-1:0]              cohort_start_mask,
+    input  wire [15:0]                       cohort_start_flags,
+    input  wire [15:0]                       cohort_start_cull,
+    input  wire [`VX_CFG_MEM_ADDR_WIDTH-1:0] cohort_start_scene,
 
     input  wire                              ray_wr_valid,
     input  wire [CTX_TAG_W-1:0]              ray_wr_ctx,
+    input  wire [`LOG2UP(NUM_COHORTS)-1:0]   ray_wr_cohort,
+    input  wire [`LOG2UP(NUM_LANES)-1:0]     ray_wr_pos,
     input  wire [RTU_RAY_BEATS*32-1:0]       ray_wr_data,
 
-    // ── traversal status ──────────────────────────────────────────────
-    output wire [NUM_SLOTS-1:0]              busy,
-    output wire [NUM_SLOTS-1:0]              done,
-    output wire [NUM_SLOTS-1:0]              yield,
+    // a ctx released by the pool: its walk terminated on this EXEC pass and
+    // its walker state is quiescent, so the core may hand the id back to the
+    // free list. The record flags live on in record space, indexed {cohort,pos}.
+    output wire                              ctx_done_valid,
+    output wire [CTX_TAG_W-1:0]              ctx_done_id,
 
-    // per-context result flags (the record walk's status/mask inputs)
+    // ── traversal status (per cohort) ─────────────────────────────────
+    output wire [NUM_COHORTS-1:0]            busy,
+    output wire [NUM_COHORTS-1:0]            done,
+    output wire [NUM_COHORTS-1:0]            yield,
+
+    // record-space result flags (the record walk's status/mask inputs),
+    // indexed {cohort, pos}; NUM_CTX width covers the record space
     output wire [NUM_CTX-1:0]                       hit_bits,
     output wire [NUM_CTX-1:0]                       yld_bits,
     output wire [NUM_CTX-1:0][RTU_CB_TYPE_BITS-1:0] cb_types,
     output wire [NUM_CTX-1:0]                       attr_vld,
 
     // callback resume: the warp's per-lane actions, held stable by the core
-    input  wire [NUM_SLOTS-1:0]                       resume,
+    input  wire [NUM_COHORTS-1:0]                     resume,
     input  wire [NUM_CTX-1:0][RTU_CB_ACTION_BITS-1:0] action,
 
     // ── window store access (core side; always accepted) ──────────────
-    input  wire                                           win_wr_valid,
-    input  wire [`LOG2UP(NUM_SLOTS)+RTU_WS_WORD_BITS-1:0] win_wr_addr,
-    input  wire [(NUM_CTX/NUM_SLOTS)-1:0]                 win_wr_wren,
-    input  wire [(NUM_CTX/NUM_SLOTS)*32-1:0]              win_wr_data,
-    input  wire                                           win_rd_valid,
-    input  wire [`LOG2UP(NUM_SLOTS)+RTU_WS_WORD_BITS-1:0] win_rd_addr,
-    output wire [(NUM_CTX/NUM_SLOTS)*32-1:0]              win_rd_data,
+    input  wire                                             win_wr_valid,
+    input  wire [`LOG2UP(NUM_COHORTS)+RTU_WS_WORD_BITS-1:0] win_wr_addr,
+    input  wire [NUM_LANES-1:0]                             win_wr_wren,
+    input  wire [NUM_LANES*32-1:0]                          win_wr_data,
+    input  wire                                             win_rd_valid,
+    input  wire [`LOG2UP(NUM_COHORTS)+RTU_WS_WORD_BITS-1:0] win_rd_addr,
+    output wire [NUM_LANES*32-1:0]                          win_rd_data,
 
     // ── node/leaf fetch (context-id tagged) ───────────────────────────
     output wire                              mem_req_valid,
@@ -113,8 +136,9 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     `UNUSED_SPARAM (INSTANCE_ID)
 
     localparam FLAT      = (RTU_BVH_WIDTH == 0);
-    localparam NUM_LANES = NUM_CTX / NUM_SLOTS;
-    localparam SLOT_W    = `LOG2UP(NUM_SLOTS);
+    localparam COHORT_W  = `LOG2UP(NUM_COHORTS);
+    localparam LANE_W    = `LOG2UP(NUM_LANES);
+    localparam REC_W     = COHORT_W + LANE_W;   // record id = {cohort, pos}
     localparam LINES     = FLAT ? RTU_FLAT_LINES : RTU_NODE_LINES;
     localparam LB        = `CLOG2(LINES + 1);
     localparam BUF_BITS  = LINES * LINE_BITS;
@@ -122,8 +146,8 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     localparam NODE_W    = `UP(RTU_BVH_WIDTH);
     localparam ADDRW     = `VX_CFG_MEM_ADDR_WIDTH;
 
-    `STATIC_ASSERT(((NUM_LANES * NUM_SLOTS) == NUM_CTX),
-        ("RTU_NUM_CTX must be a whole multiple of RTU_NUM_SLOTS"))
+    `STATIC_ASSERT((NUM_CTX >= NUM_COHORTS * NUM_LANES),
+        ("the ctx pool must cover every record slot: NUM_CTX >= NUM_COHORTS * NUM_LANES"))
 
 `ifdef VX_CFG_RTU_TLAS_ENABLE
     localparam FLAT_TLAS = FLAT ? 1 : 0;
@@ -238,14 +262,21 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     reg [NUM_CTX-1:0][LB-1:0]               f_slot_q;
     reg [NUM_CTX-1:0][RTU_CB_ACTION_BITS-1:0] act_q;
 
-    // ── per-slot state ────────────────────────────────────────────────
-    reg [NUM_SLOTS-1:0]            running;
-    reg [NUM_SLOTS-1:0]            finalised;
-    reg [NUM_SLOTS-1:0]            done_r;
-    reg [NUM_SLOTS-1:0]            pend_resume;
-    reg [NUM_SLOTS-1:0][15:0]      slot_flags;
-    reg [NUM_SLOTS-1:0][15:0]      slot_cull;
-    reg [NUM_SLOTS-1:0][ADDRW-1:0] slot_scene;
+    // ── per-cohort state (the record flags above live in record space) ─
+    reg [NUM_COHORTS-1:0]            running;
+    reg [NUM_COHORTS-1:0]            finalised;
+    reg [NUM_COHORTS-1:0]            done_r;
+    reg [NUM_COHORTS-1:0]            pend_resume;
+    reg [NUM_COHORTS-1:0][15:0]      cohort_flags;
+    reg [NUM_COHORTS-1:0][15:0]      cohort_cull;
+    reg [NUM_COHORTS-1:0][ADDRW-1:0] cohort_scene;
+
+    // ── ctx → record-slot map: the bridge between the two index spaces.
+    // Written at launch, stable for the whole walk (a live ctx is never
+    // re-launched), read at SELECT beside the walker RAMs. Held in a RAM, not a
+    // flop array: it is read once per grant exactly like the walker RAMs, so the
+    // map costs NUM_CTX RAM entries instead of NUM_CTX registers + a wide mux.
+    wire [REC_W-1:0] meta_rdata;
 
     // ═══════════════════════ SELECT ═══════════════════════════════════
     // One-cycle-ahead selection: the arbiter runs on the next-cycle wake
@@ -274,11 +305,15 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     reg                 s1_valid;
     reg [CTX_TAG_W-1:0] s1_sel;
     reg                 s1_fresh;
-    wire [SLOT_W-1:0]   s1_slot = SLOT_W'(32'(s1_sel) / NUM_LANES);
+    // meta_store's registered output is valid this stage, exactly when the old
+    // s1_cohort/s1_pos registers were — so the record id rides the walker RAMs.
+    wire [COHORT_W-1:0] s1_cohort = meta_rdata[REC_W-1 -: COHORT_W];
+    wire [LANE_W-1:0]   s1_pos    = meta_rdata[LANE_W-1:0];
 
     // ═══════════════════════ ALIGN snapshot ═══════════════════════════
     reg                      x_valid;
     reg [CTX_TAG_W-1:0]      sel_q;
+    reg [REC_W-1:0]          rec_q;   // record id {cohort, pos} of sel_q
     reg                      fresh_q;
     ctx_state_t              word_q;
     lane_ray_t               ray_q;
@@ -343,6 +378,24 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
         .wdata (ray_wr_data),
         .raddr (g1_idx),
         .rdata (ray_rdata)
+    );
+
+    // ── the ctx → record map: written at launch, read at SELECT ───────
+    VX_dp_ram #(
+        .DATAW    (REC_W),
+        .SIZE     (NUM_CTX),
+        .OUT_REG  (1),
+        .RDW_MODE ("W")
+    ) meta_store (
+        .clk   (clk),
+        .reset (reset),
+        .read  (g1_valid),
+        .write (ray_wr_valid),
+        .wren  (1'b1),
+        .waddr (ray_wr_ctx),
+        .wdata ({ray_wr_cohort, ray_wr_pos}),
+        .raddr (g1_idx),
+        .rdata (meta_rdata)
     );
 
     // ── the fetched-line buffer: LINES line-RAMs per context ──────────
@@ -464,6 +517,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
             x_valid   <= s1_valid;
             if (s1_valid) begin
                 sel_q        <= s1_sel;
+                rec_q        <= {s1_cohort, s1_pos};
                 fresh_q      <= s1_fresh;
                 word_q       <= cs_word;
                 ray_q        <= lane_ray_t'(ray_rdata);
@@ -471,11 +525,11 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
                 stacktop_q   <= stk_rdata;
                 // a fresh context's store row is stale: its walk starts at the
                 // scene base (the init template's cur_off is 0)
-                structaddr_q <= slot_scene[s1_slot]
+                structaddr_q <= cohort_scene[s1_cohort]
                               + (s1_fresh ? ADDRW'(0) : ADDRW'(cs_word.cur_off));
                 sp_q         <= sp_q_arr[s1_sel];
-                flags_q      <= slot_flags[s1_slot];
-                cull_q       <= slot_cull[s1_slot];
+                flags_q      <= cohort_flags[s1_cohort];
+                cull_q       <= cohort_cull[s1_cohort];
                 {trihit_q, triback_q, trit_q, triu_q, triv_q} <= trires_rdata;
                 {xfo_q, xfd_q} <= xfres_rdata;
                 recip_q      <= recip_rdata;
@@ -826,7 +880,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
 
     typedef struct packed {
         logic [1:0]                 kind;
-        logic [CTX_TAG_W-1:0]       ctx;
+        logic [REC_W-1:0]           rec;   // record slot {cohort, pos}
         logic [RTU_CB_SBT_BITS-1:0] sbt;
         logic [31:0]                t, u, v, prim, inst, geom, cust;
     } commit_t;
@@ -855,7 +909,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     );
 
     // ═══════════════════════ window store ═════════════════════════════
-    localparam WS_ADDRW = SLOT_W + RTU_WS_WORD_BITS;
+    localparam WS_ADDRW = COHORT_W + RTU_WS_WORD_BITS;
     localparam ROW_BITS = NUM_LANES * 32;
 
     wire                 ws_wr, ws_rd;
@@ -884,8 +938,8 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     // commit engine sequencing (one row per granted cycle)
     reg  [2:0] ce_step;
     wire       ce_active = ~cf_empty;
-    wire [SLOT_W-1:0]    ce_slot = SLOT_W'(32'(cf_dout.ctx) / NUM_LANES);
-    wire [NUM_LANES-1:0] ce_lane = NUM_LANES'(1) << (32'(cf_dout.ctx) % NUM_LANES);
+    wire [COHORT_W-1:0]  ce_cohort = COHORT_W'(32'(cf_dout.rec) / NUM_LANES);
+    wire [NUM_LANES-1:0] ce_lane   = NUM_LANES'(1) << (32'(cf_dout.rec) % NUM_LANES);
 
     reg [RTU_WS_WORD_BITS-1:0] ce_word;
     reg [31:0]                 ce_data;
@@ -953,7 +1007,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     reg [3:0]           bw_state;
     reg                 bw_is_res;
     reg                 bw_job_done;
-    reg [SLOT_W-1:0]    bw_slot;
+    reg [COHORT_W-1:0]  bw_cohort;
     reg [2:0]           bw_field;
     reg [1:0]           bw_zidx;
     reg [NUM_LANES-1:0] bw_copy_mask;   // CHS lanes (FIN) / accepted lanes (RES)
@@ -964,31 +1018,33 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     wire bw_idle = (bw_state == BW_IDLE);
     wire ce_idle = cf_empty;
 
-    // per-slot completion / finalise conditions (combinational on hot bits)
-    wire [NUM_CTX-1:0] ctx_active = mask_q & ~done_q;
-    wire [NUM_SLOTS-1:0] all_done;
-    wire [NUM_SLOTS-1:0] yld_any;
-    for (genvar s = 0; s < NUM_SLOTS; ++s) begin : g_slot_status
-        assign all_done[s] = ~(| ctx_active[s*NUM_LANES +: NUM_LANES]);
+    // per-cohort completion / finalise conditions (combinational on the
+    // record-space flags: a record slot clears when its ray's walk terminates,
+    // whatever the pool did with the ctx afterwards)
+    wire [NUM_CTX-1:0] rec_active = mask_q & ~done_q;
+    wire [NUM_COHORTS-1:0] all_done;
+    wire [NUM_COHORTS-1:0] yld_any;
+    for (genvar s = 0; s < NUM_COHORTS; ++s) begin : g_cohort_status
+        assign all_done[s] = ~(| rec_active[s*NUM_LANES +: NUM_LANES]);
         assign yld_any[s]  = | yld_q[s*NUM_LANES +: NUM_LANES];
     end
 
-    // CHS / MISS staging masks for the first slot awaiting finalise. The
+    // CHS / MISS staging masks for the first cohort awaiting finalise. The
     // commit queue must have drained: the staged rows it still holds belong
-    // to this slot's own candidates.
-    reg [SLOT_W-1:0] fin_slot;
-    reg              fin_req;
+    // to this cohort's own candidates.
+    reg [COHORT_W-1:0] fin_cohort;
+    reg                fin_req;
     always @(*) begin
-        fin_req  = 1'b0;
-        fin_slot = '0;
-        for (integer s = 0; s < NUM_SLOTS; s = s + 1) begin
+        fin_req    = 1'b0;
+        fin_cohort = '0;
+        for (integer s = 0; s < NUM_COHORTS; s = s + 1) begin
             if (!fin_req && running[s] && all_done[s] && !finalised[s] && ce_idle) begin
-                fin_req  = 1'b1;
-                fin_slot = SLOT_W'(s);
+                fin_req    = 1'b1;
+                fin_cohort = COHORT_W'(s);
             end
         end
     end
-    wire [31:0] fin_flags = 32'(slot_flags[fin_slot]);
+    wire [31:0] fin_flags = 32'(cohort_flags[fin_cohort]);
     wire fin_chs_en  = ((fin_flags & 32'(`VX_RT_FLAG_ENABLE_CHS)) != 0)
                     && ((fin_flags & 32'(`VX_RT_FLAG_SKIP_CLOSEST_HIT)) == 0);
     wire fin_miss_en = ((fin_flags & 32'(`VX_RT_FLAG_ENABLE_MISS)) != 0);
@@ -996,26 +1052,26 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     always @(*) begin
         for (integer j = 0; j < NUM_LANES; j = j + 1) begin
             fin_chs_mask[j]  = fin_req && fin_chs_en
-                            && mask_q[32'(fin_slot)*NUM_LANES + j]
-                            && !yld_q[32'(fin_slot)*NUM_LANES + j]
-                            && hit_q[32'(fin_slot)*NUM_LANES + j];
+                            && mask_q[32'(fin_cohort)*NUM_LANES + j]
+                            && !yld_q[32'(fin_cohort)*NUM_LANES + j]
+                            && hit_q[32'(fin_cohort)*NUM_LANES + j];
             fin_miss_mask[j] = fin_req && fin_miss_en
-                            && mask_q[32'(fin_slot)*NUM_LANES + j]
-                            && !yld_q[32'(fin_slot)*NUM_LANES + j]
-                            && !hit_q[32'(fin_slot)*NUM_LANES + j];
+                            && mask_q[32'(fin_cohort)*NUM_LANES + j]
+                            && !yld_q[32'(fin_cohort)*NUM_LANES + j]
+                            && !hit_q[32'(fin_cohort)*NUM_LANES + j];
         end
     end
     wire fin_trivial = fin_req && (fin_chs_mask == '0) && (fin_miss_mask == '0);
     wire fin_start   = fin_req && !fin_trivial && bw_idle;
 
-    wire [SLOT_W-1:0] res_slot_enc;
-    wire              res_req;
+    wire [COHORT_W-1:0] res_cohort_enc;
+    wire                res_req;
     VX_priority_encoder #(
-        .N (NUM_SLOTS)
-    ) res_slot_pe (
+        .N (NUM_COHORTS)
+    ) res_cohort_pe (
         .data_in    (pend_resume),
         `UNUSED_PIN (onehot_out),
-        .index_out  (res_slot_enc),
+        .index_out  (res_cohort_enc),
         .valid_out  (res_req)
     );
     wire res_start = res_req && !fin_start && bw_idle;
@@ -1023,9 +1079,9 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     reg [NUM_LANES-1:0] res_acc_mask;
     always @(*) begin
         for (integer j = 0; j < NUM_LANES; j = j + 1) begin
-            res_acc_mask[j] = yld_q[32'(res_slot_enc)*NUM_LANES + j]
-                && ((act_q[32'(res_slot_enc)*NUM_LANES + j] == RTU_CB_ACTION_BITS'(`VX_RT_CB_ACCEPT))
-                 || (act_q[32'(res_slot_enc)*NUM_LANES + j] == RTU_CB_ACTION_BITS'(`VX_RT_CB_TERMINATE)));
+            res_acc_mask[j] = yld_q[32'(res_cohort_enc)*NUM_LANES + j]
+                && ((act_q[32'(res_cohort_enc)*NUM_LANES + j] == RTU_CB_ACTION_BITS'(`VX_RT_CB_ACCEPT))
+                 || (act_q[32'(res_cohort_enc)*NUM_LANES + j] == RTU_CB_ACTION_BITS'(`VX_RT_CB_TERMINATE)));
         end
     end
 
@@ -1050,20 +1106,20 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
         case (bw_state)
         BW_RD: begin
             bw_rd_req  = 1'b1;
-            bw_rd_addr = {bw_slot, bw_src_base + RTU_WS_WORD_BITS'(32'(bw_field))};
+            bw_rd_addr = {bw_cohort, bw_src_base + RTU_WS_WORD_BITS'(32'(bw_field))};
         end
         BW_RD2: begin
             bw_rd_req  = 1'b1;
-            bw_rd_addr = {bw_slot, RTU_WS_WORD_BITS'(RTU_WS_CONT_T)};
+            bw_rd_addr = {bw_cohort, RTU_WS_WORD_BITS'(RTU_WS_CONT_T)};
         end
         BW_WR: begin
             bw_wr_req  = 1'b1;
-            bw_wr_addr = {bw_slot, bw_dst_base + RTU_WS_WORD_BITS'(32'(bw_field))};
+            bw_wr_addr = {bw_cohort, bw_dst_base + RTU_WS_WORD_BITS'(32'(bw_field))};
             bw_wr_mask = bw_copy_mask;
             for (integer j = 0; j < NUM_LANES; j = j + 1) begin
                 // a PROC accept commits the intersection shader's own t
                 if (bw_is_res && (bw_field == 3'd0)
-                 && (cbtype_q[32'(bw_slot)*NUM_LANES + j] == RTU_CB_TYPE_BITS'(`VX_RT_CB_TYPE_PROC))) begin
+                 && (cbtype_q[32'(bw_cohort)*NUM_LANES + j] == RTU_CB_TYPE_BITS'(`VX_RT_CB_TYPE_PROC))) begin
                     bw_wr_data[j*32 +: 32] = bw_data2[j*32 +: 32];
                 end else begin
                     bw_wr_data[j*32 +: 32] = bw_data[j*32 +: 32];
@@ -1072,7 +1128,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
         end
         BW_ZMISS: begin
             bw_wr_req  = 1'b1;
-            bw_wr_addr = {bw_slot, RTU_WS_WORD_BITS'(RTU_WS_YLD_BASE)
+            bw_wr_addr = {bw_cohort, RTU_WS_WORD_BITS'(RTU_WS_YLD_BASE)
                           + ((bw_zidx == 2'd0) ? RTU_WS_WORD_BITS'(RTU_WS_F_INST)
                            : (bw_zidx == 2'd1) ? RTU_WS_WORD_BITS'(RTU_WS_F_GEOM)
                                                : RTU_WS_WORD_BITS'(RTU_WS_F_CUST))};
@@ -1081,11 +1137,11 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
         end
         BW_ATTRR: begin
             bw_rd_req  = 1'b1;
-            bw_rd_addr = {bw_slot, RTU_WS_WORD_BITS'(RTU_WS_CONT_ATTR)};
+            bw_rd_addr = {bw_cohort, RTU_WS_WORD_BITS'(RTU_WS_CONT_ATTR)};
         end
         BW_ATTRW: begin
             bw_wr_req  = 1'b1;
-            bw_wr_addr = {bw_slot, RTU_WS_WORD_BITS'(RTU_WS_RES_ATTR)};
+            bw_wr_addr = {bw_cohort, RTU_WS_WORD_BITS'(RTU_WS_RES_ATTR)};
             bw_wr_mask = bw_copy_mask;
             bw_wr_data = bw_data;
         end
@@ -1102,7 +1158,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
 
     assign ws_wr    = win_wr_valid || ce_wr_gnt || bw_wr_gnt;
     assign ws_waddr = win_wr_valid ? win_wr_addr
-                    : ce_wr_gnt    ? {ce_slot, ce_word}
+                    : ce_wr_gnt    ? {ce_cohort, ce_word}
                                    : bw_wr_addr;
     assign ws_wren  = win_wr_valid ? win_wr_wren
                     : ce_wr_gnt    ? ce_lane
@@ -1186,7 +1242,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
         stk_wr_r      = 1'b0;
         stk_wdata_r   = '0;
 
-        cf_din_r.ctx = sel_q;
+        cf_din_r.rec = rec_q;
 
         case (word_x.cstate)
         CS_SETUP: begin
@@ -1393,7 +1449,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
             // woken by the collector: the raw AABB result landed
             if (coll_hit_q
              && (coll_t0_q < word_x.best_t)
-             && (!yld_q[sel_q] || (coll_t0_q < word_x.yld_t))) begin
+             && (!yld_q[rec_q] || (coll_t0_q < word_x.yld_t))) begin
                 cf_din_r.kind = CK_YLDP;
                 cf_din_r.t    = coll_t0_q;
                 cf_din_r.prim = word_x.prim_base;
@@ -1473,7 +1529,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
                     exec_hit_set  = 1'b1;
                     word_n.best_t = trit_q;
                     // a closer opaque hit occludes a farther candidate
-                    if (yld_q[sel_q] && (word_x.yld_t >= trit_q)) begin
+                    if (yld_q[rec_q] && (word_x.yld_t >= trit_q)) begin
                         exec_yld_clr = 1'b1;
                     end
                     if (term_first) begin
@@ -1490,7 +1546,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
                     end
                 end
             end else if (tri_committable
-                      && (!yld_q[sel_q] || (trit_q < word_x.yld_t))) begin
+                      && (!yld_q[rec_q] || (trit_q < word_x.yld_t))) begin
                 cf_din_r.kind = CK_YLDA;
                 cf_din_r.t    = trit_q;
                 cf_din_r.u    = triu_q;
@@ -1647,7 +1703,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
         end
         CS_INST_NEXT: begin
             word_n.in_blas = 1'b0;
-            if ((FLAT_TLAS != 0) && yld_q[sel_q]) begin
+            if ((FLAT_TLAS != 0) && yld_q[rec_q]) begin
                 // the flat instance loop stops on a staged candidate
                 word_n.cstate = CS_DONE;
                 exec_done     = 1'b1;
@@ -1711,6 +1767,12 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     assign mem_req_addr  = structaddr_q + (ADDRW'(mem_fslot) << RTU_LINE_SEL_BITS);
     assign mem_req_tag   = sel_q;
 
+    // the pool release pulse: this ctx's walk terminated on this EXEC pass and
+    // it re-wakes nothing (no done branch sets wake_self), so its walker state
+    // is quiescent from this cycle on
+    assign ctx_done_valid = x_valid && exec_done;
+    assign ctx_done_id    = sel_q;
+
     // ═══════════════════════ hot-state update ═════════════════════════
     // The wake vector's next state, fed to the SELECT arbiter. Wake events
     // take priority over the in-flight grant's clear. The two deep sources
@@ -1764,42 +1826,42 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
             // SELECT's clear and the event wakes are folded into rdy_next
             rdy_set <= rdy_next;
 
-            // slot launch: arm the slot before its rays land
-            if (slot_start_valid) begin
-                running[slot_start_slot]    <= 1'b1;
-                finalised[slot_start_slot]  <= 1'b0;
-                slot_flags[slot_start_slot] <= slot_start_flags;
-                slot_cull[slot_start_slot]  <= slot_start_cull;
-                slot_scene[slot_start_slot] <= slot_start_scene;
+            // cohort launch: arm the record space before its rays land
+            if (cohort_start_valid) begin
+                running[cohort_start_cohort]      <= 1'b1;
+                finalised[cohort_start_cohort]    <= 1'b0;
+                cohort_flags[cohort_start_cohort] <= cohort_start_flags;
+                cohort_cull[cohort_start_cohort]  <= cohort_start_cull;
+                cohort_scene[cohort_start_cohort] <= cohort_start_scene;
                 for (k = 0; k < NUM_LANES; k = k + 1) begin
-                    mask_q[32'(slot_start_slot)*NUM_LANES + k] <= slot_start_mask[k];
-                    done_q[32'(slot_start_slot)*NUM_LANES + k] <= ~slot_start_mask[k];
-                    hit_q[32'(slot_start_slot)*NUM_LANES + k]  <= 1'b0;
-                    yld_q[32'(slot_start_slot)*NUM_LANES + k]  <= 1'b0;
-                    attr_q[32'(slot_start_slot)*NUM_LANES + k] <= 1'b0;
+                    mask_q[32'(cohort_start_cohort)*NUM_LANES + k] <= cohort_start_mask[k];
+                    done_q[32'(cohort_start_cohort)*NUM_LANES + k] <= ~cohort_start_mask[k];
+                    hit_q[32'(cohort_start_cohort)*NUM_LANES + k]  <= 1'b0;
+                    yld_q[32'(cohort_start_cohort)*NUM_LANES + k]  <= 1'b0;
+                    attr_q[32'(cohort_start_cohort)*NUM_LANES + k] <= 1'b0;
                 end
             end
 
-            // a lane's ray landed: that context launches fresh
+            // a ray landed: bind the pool ctx to its record slot, launch fresh
             if (ray_wr_valid) begin
                 fresh_set[ray_wr_ctx] <= 1'b1;
             end
 
-            // EXEC outcomes
+            // EXEC outcomes: walker state by ctx, record flags by rec
             if (x_valid) begin
                 fresh_set[sel_q] <= 1'b0;
                 if (exec_done) begin
-                    done_q[sel_q] <= 1'b1;
+                    done_q[rec_q] <= 1'b1;
                 end
                 if (exec_hit_set) begin
-                    hit_q[sel_q] <= 1'b1;
+                    hit_q[rec_q] <= 1'b1;
                 end
                 if (exec_yld_set) begin
-                    yld_q[sel_q]    <= 1'b1;
-                    cbtype_q[sel_q] <= exec_cbtype;
+                    yld_q[rec_q]    <= 1'b1;
+                    cbtype_q[rec_q] <= exec_cbtype;
                 end
                 if (exec_yld_clr) begin
-                    yld_q[sel_q] <= 1'b0;
+                    yld_q[rec_q] <= 1'b0;
                 end
                 if (fresh_q) begin
                     sp_q_arr[sel_q] <= '0;
@@ -1814,7 +1876,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
             end
 
             // resume: capture the actions, queue the walker job
-            for (k = 0; k < NUM_SLOTS; k = k + 1) begin
+            for (k = 0; k < NUM_COHORTS; k = k + 1) begin
                 if (resume[k]) begin
                     pend_resume[k] <= 1'b1;
                 end
@@ -1822,10 +1884,10 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
 
             // trivial finalise (no CHS/MISS staging)
             if (fin_trivial) begin
-                finalised[fin_slot] <= 1'b1;
+                finalised[fin_cohort] <= 1'b1;
             end
             if (res_start) begin
-                pend_resume[res_slot_enc] <= 1'b0;
+                pend_resume[res_cohort_enc] <= 1'b0;
             end
 
             // barrier-walker completion commits the whole job's flag updates
@@ -1833,28 +1895,28 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
                 if (bw_is_res) begin
                     for (k = 0; k < NUM_LANES; k = k + 1) begin
                         if (bw_copy_mask[k]) begin
-                            hit_q[32'(bw_slot)*NUM_LANES + k]  <= 1'b1;
-                            attr_q[32'(bw_slot)*NUM_LANES + k] <= 1'b1;
+                            hit_q[32'(bw_cohort)*NUM_LANES + k]  <= 1'b1;
+                            attr_q[32'(bw_cohort)*NUM_LANES + k] <= 1'b1;
                         end
-                        yld_q[32'(bw_slot)*NUM_LANES + k] <= 1'b0;
+                        yld_q[32'(bw_cohort)*NUM_LANES + k] <= 1'b0;
                     end
                 end else begin
                     for (k = 0; k < NUM_LANES; k = k + 1) begin
                         if (bw_copy_mask[k]) begin
-                            yld_q[32'(bw_slot)*NUM_LANES + k]    <= 1'b1;
-                            cbtype_q[32'(bw_slot)*NUM_LANES + k] <= RTU_CB_TYPE_BITS'(`VX_RT_CB_TYPE_CHS);
+                            yld_q[32'(bw_cohort)*NUM_LANES + k]    <= 1'b1;
+                            cbtype_q[32'(bw_cohort)*NUM_LANES + k] <= RTU_CB_TYPE_BITS'(`VX_RT_CB_TYPE_CHS);
                         end
                         if (bw_miss_mask[k]) begin
-                            yld_q[32'(bw_slot)*NUM_LANES + k]    <= 1'b1;
-                            cbtype_q[32'(bw_slot)*NUM_LANES + k] <= RTU_CB_TYPE_BITS'(`VX_RT_CB_TYPE_MISS);
+                            yld_q[32'(bw_cohort)*NUM_LANES + k]    <= 1'b1;
+                            cbtype_q[32'(bw_cohort)*NUM_LANES + k] <= RTU_CB_TYPE_BITS'(`VX_RT_CB_TYPE_MISS);
                         end
                     end
-                    finalised[bw_slot] <= 1'b1;
+                    finalised[bw_cohort] <= 1'b1;
                 end
             end
 
-            // slot completion: all contexts retired, nothing left to yield
-            for (k = 0; k < NUM_SLOTS; k = k + 1) begin
+            // cohort completion: all records retired, nothing left to yield
+            for (k = 0; k < NUM_COHORTS; k = k + 1) begin
                 if (running[k] && all_done[k] && finalised[k] && !yld_any[k]
                  && ce_idle && bw_idle && !pend_resume[k]) begin
                     running[k] <= 1'b0;
@@ -1866,7 +1928,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
 
     // actions are captured at the resume pulse
     always_ff @(posedge clk) begin
-        for (integer s2 = 0; s2 < NUM_SLOTS; s2 = s2 + 1) begin
+        for (integer s2 = 0; s2 < NUM_COHORTS; s2 = s2 + 1) begin
             if (resume[s2]) begin
                 for (integer j = 0; j < NUM_LANES; j = j + 1) begin
                     act_q[s2*NUM_LANES + j] <= action[s2*NUM_LANES + j];
@@ -1924,7 +1986,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
             BW_IDLE: begin
                 if (fin_start) begin
                     bw_is_res    <= 1'b0;
-                    bw_slot      <= fin_slot;
+                    bw_cohort    <= fin_cohort;
                     bw_copy_mask <= fin_chs_mask;
                     bw_miss_mask <= fin_miss_mask;
                     bw_field     <= '0;
@@ -1932,7 +1994,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
                     bw_state     <= (fin_chs_mask != '0) ? BW_RD : BW_ZMISS;
                 end else if (res_start) begin
                     bw_is_res    <= 1'b1;
-                    bw_slot      <= res_slot_enc;
+                    bw_cohort    <= res_cohort_enc;
                     bw_copy_mask <= res_acc_mask;
                     bw_miss_mask <= '0;
                     bw_field     <= '0;
@@ -2014,7 +2076,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
     // ── outputs ───────────────────────────────────────────────────────
     assign busy = running;
     assign done = done_r;
-    for (genvar s = 0; s < NUM_SLOTS; ++s) begin : g_yield
+    for (genvar s = 0; s < NUM_COHORTS; ++s) begin : g_yield
         assign yield[s] = running[s] && all_done[s] && finalised[s] && yld_any[s]
                        && ce_idle && bw_idle && !pend_resume[s];
     end
@@ -2036,7 +2098,7 @@ module VX_rtu_scheduler import VX_gpu_pkg::*, VX_fpu_pkg::*, VX_rtu_pkg::*; #(
                 $time, INSTANCE_ID, tri_tag_out, tri_hit, tri_t))
         end
         if (| done_r) begin
-            `TRACE(1, ("%t: %s rtu-done: slots=%b\n", $time, INSTANCE_ID, done_r))
+            `TRACE(1, ("%t: %s rtu-done: cohorts=%b\n", $time, INSTANCE_ID, done_r))
         end
     end
 `endif
